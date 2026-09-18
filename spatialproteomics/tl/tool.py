@@ -750,6 +750,88 @@ class ToolAccessor:
 
         return self._obj.pp.add_obs_from_dataframe(counts.reset_index(drop=True))
 
+    def virtues(
+        self,
+        mode: str = "segment",
+        protein_mapping: Optional[pd.DataFrame] = None,
+        marker_col: str = "marker_name",
+        protein_id_col: str = "protein_id",
+        image_key: str = Layers.IMAGE,
+        model_name: str = "virtues-sp32",
+        cache_dir=None,
+        quantile: float = 0.99,
+        mean=None,
+        std=None,
+        gaussian_blur: bool = True,
+        gaussian_blur_sigma: float = 1.0,
+        store_patch_embeddings: bool = False,
+        tile_size: int = 128,
+        segment_overlap: int = 32,
+        cell_token_stride: int = 42,
+        batch_size=None,
+        segmentation_key_used: str = Layers.SEGMENTATION,
+        segmentation_key_added: str = "_virtues_segmentation",
+        cell_type_mask_key_added: str = "_virtues_cell_type_mask",
+        cell_type_label_key_added: str = "_virtues_cell_type",
+        cell_embedding_key_added: str = "_virtues_cell_embeddings",
+        marker_embedding_key_added: str = "_virtues_marker_embeddings",
+        patch_embedding_key_added: str = "_virtues_patch_embeddings",
+        patch_coord_key_added: str = "_virtues_patch_coords",
+        overwrite: bool = False,
+        device: str = "cuda",
+    ) -> xr.Dataset:
+        from .virtues import virtues
+
+        return virtues(
+            self._obj,
+            mode=mode,
+            protein_mapping=protein_mapping,
+            marker_col=marker_col,
+            protein_id_col=protein_id_col,
+            image_key=image_key,
+            model_name=model_name,
+            cache_dir=cache_dir,
+            quantile=quantile,
+            mean=mean,
+            std=std,
+            gaussian_blur=gaussian_blur,
+            gaussian_blur_sigma=gaussian_blur_sigma,
+            store_patch_embeddings=store_patch_embeddings,
+            tile_size=tile_size,
+            segment_overlap=segment_overlap,
+            cell_token_stride=cell_token_stride,
+            batch_size=batch_size,
+            segmentation_key_used=segmentation_key_used,
+            segmentation_key_added=segmentation_key_added,
+            cell_type_mask_key_added=cell_type_mask_key_added,
+            cell_type_label_key_added=cell_type_label_key_added,
+            cell_embedding_key_added=cell_embedding_key_added,
+            marker_embedding_key_added=marker_embedding_key_added,
+            patch_embedding_key_added=patch_embedding_key_added,
+            patch_coord_key_added=patch_coord_key_added,
+            overwrite=overwrite,
+            device=device,
+        )
+
+    def virtues_aggregate_patch_embeddings(
+        self,
+        patch_embedding_key: str = "_virtues_patch_embeddings",
+        patch_coord_key: str = "_virtues_patch_coords",
+        segmentation_key: str = Layers.SEGMENTATION,
+        key_added: str = "_virtues_cell_embeddings",
+        overwrite: bool = False,
+    ) -> xr.Dataset:
+        from .virtues import virtues_aggregate_patch_embeddings
+
+        return virtues_aggregate_patch_embeddings(
+            self._obj,
+            patch_embedding_key=patch_embedding_key,
+            patch_coord_key=patch_coord_key,
+            segmentation_key=segmentation_key,
+            key_added=key_added,
+            overwrite=overwrite,
+        )
+
     def convert_to_anndata(
         self,
         expression_matrix_key: str = Layers.INTENSITY,
