@@ -325,7 +325,7 @@ def preprocess_for_virtues(
     obj: xr.Dataset,
     mapping: pd.DataFrame,
     image_key: str,
-    quantile: float,
+    quantile: float = 0.99,
     mean=None,
     std=None,
     gaussian_blur: bool = True,
@@ -724,7 +724,7 @@ def project_virtues_cell_types_to_existing_segmentation(
     if Dims.CELLS not in obj.coords:
         raise ValueError("Cannot project VirTues cell types without a cells coordinate.")
 
-    cell_types = np.zeros_like(cell_type_mask, dtype=np.int32)
+    cell_types = []
     for cell_id in obj.coords[Dims.CELLS].values:
         mask = segmentation == cell_id
         if np.sum(mask) == 0:
@@ -809,10 +809,9 @@ def run_virtues_segmentation(
     else:
         segmentation, semantic_logits = output
 
-    # TODO: check that these types correspond to the virtues implementation 
     segmentation = segmentation.cpu().numpy().astype(np.int32)
-    semantic_prediction = semantic_logits.argmax(0).cpu().numpy().astype(np.int16)
-    cell_type_mask = assign_cell_types(segmentation.astype(np.int32), semantic_prediction).astype(np.int16)
+    semantic_prediction = semantic_logits.argmax(0).cpu().numpy().astype(np.int32)
+    cell_type_mask = assign_cell_types(segmentation, semantic_prediction).astype(np.int16)
 
     attrs = {
         "model_name": model_name,
@@ -857,6 +856,7 @@ def run_virtues_segmentation(
             "token_stride_px": TOKEN_PATCH_SIZE_PX,
         }
         patch_attrs.update(preprocessing_attrs) #TODO: check what this does actually -- are there duplicates from the one before or how is it handled? 
+
         obj = add_patch_embeddings(
             obj,
             patch_embeddings.cpu().numpy(),
