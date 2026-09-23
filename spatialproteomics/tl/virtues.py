@@ -929,7 +929,7 @@ def run_virtues_cell_embedding(
     except ImportError as exc:
         raise _optional_import_error("torch", exc)
 
-    segmentation = torch.as_tensor(obj[segmentation_key_used].values, device=device)
+    segmentation = torch.as_tensor(obj[segmentation_key_used].values, device="cpu")
     cell_ids, cell_tokens, crop_tokens, indices = compute_cell_tokens(
         virtues_model,
         torch.as_tensor(image, dtype=torch.float32, device=device),
