@@ -300,7 +300,9 @@ def get_or_create_marker_embeddings(
     return obj, torch.as_tensor(embeddings, dtype=torch.float32, device=device)
 
 
-def _resolve_mean_std(mean, std, markers: list[str]) -> tuple[np.ndarray, np.ndarray, str]:
+def _resolve_mean_std(mean: Optional[pd.Series], 
+                      std: Optional[pd.Series], 
+                      markers: list[str]) -> tuple[np.ndarray, np.ndarray, str]:
     if (mean is None) != (std is None):
         raise ValueError("mean and std must either both be supplied or both be None.")
     if mean is None:
@@ -326,8 +328,8 @@ def preprocess_for_virtues(
     mapping: pd.DataFrame,
     image_key: str,
     quantile: float = 0.99,
-    mean=None,
-    std=None,
+    mean: Optional[pd.Series] = None,
+    std: Optional[pd.Series] = None,
     gaussian_blur: bool = True,
     gaussian_blur_sigma: float = 1.0,
 ):
@@ -1025,8 +1027,8 @@ def virtues(
     cache_dir=None,
     virtues_path=None,
     quantile: float = 0.99,
-    mean=None,
-    std=None,
+    mean: Optional[pd.Series] = None,
+    std: Optional[pd.Series] = None,
     gaussian_blur: bool = True,
     gaussian_blur_sigma: float = 1.0,
     store_patch_embeddings: bool = False,
