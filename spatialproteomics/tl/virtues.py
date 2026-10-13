@@ -243,7 +243,7 @@ def add_marker_embeddings(
     )
     
     fields = ["marker_name", "protein_id", "channel_index", "marker_embedding_index"]
-    metadata = stored_mapping.loc[:, fields].astype(object).to_numpy()
+    metadata = stored_mapping.loc[:, fields].astype(str).to_numpy()
     metadata_array = xr.DataArray(
         metadata,
         dims=[dim_name, MARKER_METADATA_DIM],
@@ -384,7 +384,7 @@ def preprocess_for_virtues(
     # apply Gaussian blur if requested
     if gaussian_blur:
         for idx in range(image.shape[0]):
-            image[idx] = gaussian_filter(image[idx], sigma=gaussian_blur_sigma)
+            image[idx] = gaussian_filter(image[idx], sigma=gaussian_blur_sigma, truncate=1.0)
 
     attrs = {
         "image_key": image_key,
@@ -798,22 +798,36 @@ def run_virtues_segmentation(
             )
         kwargs["return_patch_embeddings"] = True
 
-    output = segmentation_model.segment_tissue(
-        torch.as_tensor(image, dtype=torch.float32, device=device),
-        torch.arange(len(mapping), dtype=torch.long, device=device),
-        tile_size=tile_size,
-        overlap=segment_overlap,
-        batch_size=batch_size,
-        **kwargs,
-    )
+    # on `torch.arange` (vs. `midxs`): The wrapper builds a compact marker embedding matrix 
+    # in mapping order, so channel ids are dense row indices into that compact matrix.
+    with torch.inference_mode():
+        output = segmentation_model.segment_tissue(
+            torch.as_tensor(image, dtype=torch.float32, device=device),
+            torch.arange(len(mapping), dtype=torch.long, device=device),
+            tile_size=tile_size,
+            overlap=segment_overlap,
+            batch_size=batch_size,
+            **kwargs,
+        )
     if store_patch_embeddings:
         segmentation, semantic_logits, patch_embeddings, patch_coords_yx = output
     else:
         segmentation, semantic_logits = output
 
+
     segmentation = segmentation.cpu().numpy().astype(np.int32)
-    semantic_prediction = semantic_logits.argmax(0).cpu().numpy().astype(np.int32)
-    cell_type_mask = assign_cell_types(segmentation, semantic_prediction).astype(np.int16)
+
+    #-------- suppress cell types None and Unknown, following the VirTues tutorial. 
+    reverse_cell_type_mapping = {v: k for k, v in VIRTUES_CELL_TYPE_MAPPING.items()}
+    suppressed_cell_type_ids = [
+        reverse_cell_type_mapping[cell_type]
+        for cell_type in ["None", "Unknown"]
+    ]
+    semantic_logits = semantic_logits.cpu().clone()
+    semantic_logits[suppressed_cell_type_ids, :, :] = float("-inf")
+    #-------- 
+    semantic_prediction = semantic_logits.argmax(0).numpy().astype(np.int32)
+    cell_type_mask = assign_cell_types(segmentation, semantic_prediction).astype(np.int16)    
 
     attrs = {
         "model_name": model_name,
@@ -821,6 +835,7 @@ def run_virtues_segmentation(
         "tile_size_px": tile_size,
         "segment_overlap_px": segment_overlap,
         "batch_size": batch_size,
+        "cell_type_suppressed_classes": ["None", "Unknown"],
     }
     attrs.update(preprocessing_attrs)
     obj = add_virtues_segmentation_outputs(
