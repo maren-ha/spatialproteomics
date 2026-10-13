@@ -101,6 +101,42 @@ def validate_and_normalize_protein_mapping(
     protein_id_col: str,
     model_name: str,
 ) -> pd.DataFrame:
+    """
+    Validate and normalize the marker-to-protein mapping for VirTues.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object containing the image channel coordinates.
+    protein_mapping : pd.DataFrame
+        A dataframe with one row per marker to use for VirTues.
+    marker_col : str
+        The column in ``protein_mapping`` containing marker names.
+    protein_id_col : str
+        The column in ``protein_mapping`` containing UniProt IDs.
+    model_name : str
+        The VirTues model name.
+
+    Returns
+    -------
+    pd.DataFrame
+        A normalized mapping table with columns ``marker_name``, ``protein_id``, ``channel_index``,
+        and ``marker_embedding_index``.
+
+    Raises
+    ------
+    ValueError
+        If the model name is unsupported, required columns are missing, protein IDs are empty,
+        marker names are duplicated, or no mapped markers are present in the object.
+    TypeError
+        If ``protein_mapping`` is not a pandas DataFrame.
+
+    Notes
+    -----
+    UniProt IDs are never inferred from marker names. Markers that are present in ``protein_mapping``
+    but absent from the image channels are dropped with a warning.
+    Marker names and protein IDs are converted to strings and stripped of surrounding whitespace.
+    """
 
     # check model name, protein mapping type, required columns, non-empty protein IDs, unique marker names, presence of markers in the image channels
     if model_name not in SUPPORTED_MODELS:
@@ -195,6 +231,34 @@ def add_marker_embeddings(
     key_added: str,
     overwrite: bool = False,
 ) -> xr.Dataset:
+    """
+    Add VirTues marker embeddings and their metadata to the object.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    embeddings : np.ndarray
+        Marker embeddings in the order of the normalized mapping table.
+    mapping : pd.DataFrame
+        The normalized marker-to-protein mapping.
+    key_added : str
+        The key under which marker embeddings will be stored.
+    overwrite : bool, optional
+        If True, overwrite existing marker embedding and metadata layers.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    If all image channels are represented, embeddings are stored on the native ``channels`` dimension
+    in image-channel order. If only a subset is represented, embeddings are stored on the
+    ``virtues_markers`` dimension in mapping order.
+    A companion metadata layer is added under ``{key_added}_metadata``.
+    """
     if embeddings.shape[0] != len(mapping):
         raise ValueError("Number of marker embeddings must match protein_mapping rows.")
 
@@ -260,6 +324,32 @@ def get_or_create_marker_embeddings(
     overwrite: bool = False,
     device: str = "cuda",
 ):
+    """
+    Reuse stored marker embeddings or create them with the VirTues ESM wrapper.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    mapping : pd.DataFrame
+        The normalized marker-to-protein mapping.
+    marker_embedding_key_added : str
+        The key under which marker embeddings are stored or will be added.
+    overwrite : bool, optional
+        If True, replace existing marker embeddings whose metadata do not match.
+    device : str, optional
+        The device used for the ESM wrapper and returned torch tensor.
+
+    Returns
+    -------
+    tuple[xr.Dataset, torch.Tensor]
+        The updated spatialproteomics object and a tensor of marker embeddings in mapping order.
+
+    Raises
+    ------
+    ValueError
+        If an existing marker embedding layer has incompatible metadata and ``overwrite`` is False.
+    """
     try:
         import torch
     except ImportError as exc:
@@ -333,6 +423,39 @@ def preprocess_for_virtues(
     gaussian_blur: bool = True,
     gaussian_blur_sigma: float = 1.0,
 ):
+    """
+    Preprocess image channels for VirTues model input.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    mapping : pd.DataFrame
+        The normalized marker-to-protein mapping defining marker order.
+    image_key : str
+        The image layer to preprocess.
+    quantile : float, optional
+        The per-channel image quantile used for clipping.
+    mean : pd.Series, optional
+        Dataset-level per-marker means, indexed by marker name.
+    std : pd.Series, optional
+        Dataset-level per-marker standard deviations, indexed by marker name.
+    gaussian_blur : bool, optional
+        If True, apply a Gaussian blur after standardization.
+    gaussian_blur_sigma : float, optional
+        The Gaussian blur sigma.
+
+    Returns
+    -------
+    tuple[np.ndarray, dict]
+        The preprocessed image with shape ``[channels, y, x]`` and a dictionary with preprocessing metadata.
+
+    Notes
+    -----
+    The image is subset to mapped markers, clipped to ``[0, q]``, transformed with ``log1p``,
+    standardized, and optionally blurred. If ``mean`` and ``std`` are not supplied, image-level
+    values are used with a warning. Negative values are set to zero by the clipping step.
+    """
     if image_key not in obj:
         raise KeyError(f"Image layer {image_key!r} not found.")
     if not np.isfinite(quantile) or quantile < 0 or quantile > 1:
@@ -463,6 +586,37 @@ def add_patch_embeddings(
     attrs: dict,
     overwrite: bool = False,
 ) -> xr.Dataset:
+    """
+    Add VirTues patch embeddings and their crop coordinates to the object.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    patch_embeddings : np.ndarray
+        Patch embeddings with shape ``[patch, token_y, token_x, embedding]``.
+    patch_coords_yx : np.ndarray
+        Top-left crop coordinates with shape ``[patch, 2]`` in ``(y, x)`` order.
+    patch_embedding_key_added : str
+        The key under which patch embeddings will be stored.
+    patch_coord_key_added : str
+        The key under which patch coordinates will be stored.
+    attrs : dict
+        Metadata to store on the patch embedding layer.
+    overwrite : bool, optional
+        If True, overwrite existing patch embedding and coordinate layers.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    Patch embeddings are stored by crop and token position. Coordinates are not stitched into image
+    ``x``/``y`` space. Embeddings are stored as ``float16``; coordinates are stored as integer
+    top-left ``(y, x)`` positions and include attrs pointing back to the paired embedding layer.
+    """
     if patch_embeddings.ndim != 4:
         raise ValueError("patch_embeddings must have shape [patch, token_y, token_x, embedding].")
 
@@ -548,6 +702,35 @@ def add_virtues_segmentation_outputs(
     attrs: dict,
     overwrite: bool = False,
 ) -> xr.Dataset:
+    """
+    Add VirTues segmentation and cell type mask layers to the object.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    segmentation : np.ndarray
+        VirTues instance segmentation with shape ``[y, x]``.
+    cell_type_mask : np.ndarray
+        VirTues cell type mask with shape ``[y, x]``.
+    segmentation_key_added : str
+        The key under which the VirTues segmentation will be stored.
+    cell_type_mask_key_added : str
+        The key under which the VirTues cell type mask will be stored.
+    attrs : dict
+        Metadata to store on both output layers.
+    overwrite : bool, optional
+        If True, overwrite existing output layers.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    The cell type mask stores the VirTues cell type mapping in its attrs.
+    """
     if segmentation.shape != (obj.sizes[Dims.Y], obj.sizes[Dims.X]):
         raise ValueError("VirTues segmentation shape must match image y/x shape.")
     if cell_type_mask.shape != segmentation.shape:
@@ -583,6 +766,34 @@ def add_virtues_embedding_outputs(
     attrs: dict,
     overwrite: bool = False,
 ) -> xr.Dataset:
+    """
+    Add VirTues cell embeddings aligned to the object's cells coordinate.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    cell_ids : np.ndarray
+        Cell IDs corresponding to rows of ``cell_embeddings``.
+    cell_embeddings : np.ndarray
+        Cell embeddings with shape ``[cells, embedding]``.
+    key_added : str
+        The key under which cell embeddings will be stored.
+    attrs : dict
+        Metadata to store on the embedding layer.
+    overwrite : bool, optional
+        If True, overwrite an existing embedding layer.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    Embeddings are aligned to ``obj.coords['cells']``. Cells without a returned
+    VirTues embedding are filled with ``nan``.
+    """
     if Dims.CELLS not in obj.coords:
         raise ValueError("Cannot store VirTues cell embeddings without a cells coordinate.")
     if len(cell_ids) != cell_embeddings.shape[0]:
@@ -618,6 +829,37 @@ def virtues_aggregate_patch_embeddings(
     overwrite: bool = False,
     virtues_path: str = None,
 ) -> xr.Dataset:
+    """
+    Aggregate stored VirTues patch embeddings into cell embeddings.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object containing patch embeddings, patch coordinates, and a segmentation layer.
+    patch_embedding_key : str, optional
+        The key of the stored patch embeddings.
+    patch_coord_key : str, optional
+        The key of the stored patch top-left coordinates.
+    segmentation_key : str, optional
+        The segmentation layer used to assign tokens to cells.
+    key_added : str, optional
+        The key under which aggregated cell embeddings will be stored.
+    overwrite : bool, optional
+        If True, overwrite an existing cell embedding layer.
+    virtues_path : str, optional
+        Reserved for API compatibility.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    Each token contributes to every overlapping cell, weighted by the number of overlapping
+    segmentation pixels. This mirrors the cell-token aggregation logic used by VirTues
+    as closely as possible.
+    """
 
     for key in [patch_embedding_key, patch_coord_key, segmentation_key]:
         if key not in obj:
@@ -716,6 +958,33 @@ def project_virtues_cell_types_to_existing_segmentation(
     cell_type_label_key_added: str = "_virtues_cell_type",
     overwrite: bool = False,
 ) -> xr.Dataset:
+    """
+    Project VirTues cell type predictions onto an existing segmentation.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    cell_type_mask : np.ndarray
+        Pixel-wise VirTues cell type mask.
+    segmentation_key : str, optional
+        The existing segmentation layer whose cells should receive labels.
+    cell_type_label_key_added : str, optional
+        The column added to ``_la_layers``.
+    overwrite : bool, optional
+        If True, overwrite an existing label layer column with the same name.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    For each existing cell, the assigned VirTues cell type is the most frequent value of
+    ``cell_type_mask`` under that cell's segmentation mask. Ties follow ``np.bincount(...).argmax()``
+    and therefore choose the lowest tied integer cell type ID.
+    """
     if segmentation_key not in obj:
         return obj
     segmentation = obj[segmentation_key].values
@@ -778,6 +1047,53 @@ def run_virtues_segmentation(
     overwrite: bool,
     device: str,
 ):
+    """
+    Run VirTues segmentation and store the requested outputs.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    image : np.ndarray
+        Preprocessed image with shape ``[channels, y, x]``.
+    mapping : pd.DataFrame
+        The normalized marker-to-protein mapping.
+    segmentation_model
+        The VirTues segmentation model.
+    model_name : str
+        The VirTues model name.
+    preprocessing_attrs : dict
+        Metadata returned by ``preprocess_for_virtues``.
+    tile_size : int
+        Tile size passed to VirTues segmentation.
+    segment_overlap : int
+        Tile overlap passed to VirTues segmentation.
+    batch_size : int
+        Batch size passed to VirTues segmentation.
+    segmentation_key_used : str
+        Existing segmentation used for optional cell type projection.
+    segmentation_key_added : str
+        Key for the VirTues segmentation output.
+    cell_type_mask_key_added : str
+        Key for the VirTues cell type mask output.
+    cell_type_label_key_added : str
+        Label column used when projecting VirTues cell types.
+    patch_embedding_key_added : str
+        Key for optional patch embeddings.
+    patch_coord_key_added : str
+        Key for optional patch coordinates.
+    store_patch_embeddings : bool
+        If True, store patch embeddings returned by the segmentation model.
+    overwrite : bool
+        If True, overwrite existing output layers.
+    device : str
+        Device used for model execution.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+    """
     try:
         from virtues.utils.segmentation import assign_cell_types
     except ImportError as exc:
@@ -929,6 +1245,49 @@ def run_virtues_cell_embedding(
     overwrite: bool,
     device: str,
 ):
+    """
+    Run VirTues cell embedding extraction and store cell-level embeddings.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    image : np.ndarray
+        Preprocessed image with shape ``[channels, y, x]``.
+    mapping : pd.DataFrame
+        The normalized marker-to-protein mapping.
+    virtues_model
+        The VirTues backbone model.
+    model_name : str
+        The VirTues model name.
+    preprocessing_attrs : dict
+        Metadata returned by ``preprocess_for_virtues``.
+    tile_size : int
+        Tile size passed to ``compute_cell_tokens``.
+    cell_token_stride : int
+        Crop stride passed to ``compute_cell_tokens``.
+    batch_size : int
+        Chunk size passed to ``compute_cell_tokens``.
+    segmentation_key_used : str
+        Existing segmentation layer used to define cells.
+    cell_embedding_key_added : str
+        Key for the cell embedding output.
+    patch_embedding_key_added : str
+        Key for optional patch embeddings.
+    patch_coord_key_added : str
+        Key for optional patch coordinates.
+    store_patch_embeddings : bool
+        If True, store crop tokens and coordinates returned by ``compute_cell_tokens``.
+    overwrite : bool
+        If True, overwrite existing output layers.
+    device : str
+        Device used for model execution.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+    """
     if segmentation_key_used not in obj:
         raise ValueError(f"mode='embed_cells' requires an existing segmentation layer {segmentation_key_used!r}.")
     if obj.sizes[Dims.Y] < tile_size or obj.sizes[Dims.X] < tile_size:
@@ -1062,6 +1421,83 @@ def virtues(
     overwrite: bool = False,
     device: str = "cuda",
 ) -> xr.Dataset:
+    """
+    Run VirTues segmentation or cell embedding extraction.
+
+    Parameters
+    ----------
+    obj : xr.Dataset
+        The spatialproteomics object.
+    mode : {"segment", "embed_cells"}, optional
+        The VirTues workflow to run. ``"segment"`` stores a VirTues segmentation and cell type mask.
+        ``"embed_cells"`` stores cell-level embeddings for an existing segmentation.
+    protein_mapping : pd.DataFrame
+        A dataframe mapping image marker names to UniProt IDs.
+    marker_col : str, optional
+        Column in ``protein_mapping`` containing marker names.
+    protein_id_col : str, optional
+        Column in ``protein_mapping`` containing UniProt IDs.
+    image_key : str, optional
+        Image layer used as VirTues input.
+    model_name : str, optional
+        VirTues model name.
+    cache_dir : str, optional
+        Hugging Face cache directory used for model downloads.
+    virtues_path : str, optional
+        Local VirTues checkout to prepend to ``sys.path`` before importing VirTues.
+    quantile : float, optional
+        Per-channel image quantile used for clipping.
+    mean : pd.Series, optional
+        Dataset-level per-marker means, indexed by marker name.
+    std : pd.Series, optional
+        Dataset-level per-marker standard deviations, indexed by marker name.
+    gaussian_blur : bool, optional
+        If True, apply a Gaussian blur after standardization.
+    gaussian_blur_sigma : float, optional
+        Gaussian blur sigma.
+    store_patch_embeddings : bool, optional
+        If True, store patch embeddings and top-left crop coordinates.
+    tile_size : int, optional
+        VirTues tile size.
+    segment_overlap : int, optional
+        Tile overlap used for segmentation.
+    cell_token_stride : int, optional
+        Crop stride used for cell embedding extraction.
+    batch_size : int, optional
+        Batch size for segmentation or chunk size for cell embedding extraction.
+    segmentation_key_used : str, optional
+        Existing segmentation used for cell embedding extraction and cell type projection.
+    segmentation_key_added : str, optional
+        Key for the VirTues segmentation output.
+    cell_type_mask_key_added : str, optional
+        Key for the VirTues cell type mask output.
+    cell_type_label_key_added : str, optional
+        Label column used when projecting VirTues cell types onto an existing segmentation.
+    cell_embedding_key_added : str, optional
+        Key for the VirTues cell embedding output.
+    marker_embedding_key_added : str, optional
+        Key for marker embeddings.
+    patch_embedding_key_added : str, optional
+        Key for optional patch embeddings.
+    patch_coord_key_added : str, optional
+        Key for optional patch coordinates.
+    overwrite : bool, optional
+        If True, overwrite existing output layers.
+    device : str, optional
+        Device used for model execution. Only ``"cuda"`` is supported in v0.1.
+
+    Returns
+    -------
+    xr.Dataset
+        The updated spatialproteomics object.
+
+    Notes
+    -----
+    UniProt IDs must be supplied explicitly in ``protein_mapping``. DAPI or Histone H3 are only used
+    if they are represented in the mapping. The canonical ``_segmentation`` layer is not overwritten
+    by default; VirTues segmentation is stored under ``_virtues_segmentation``. Optional VirTues
+    dependencies are imported only when this function is called.
+    """
     if mode not in {"segment", "embed_cells"}:
         raise ValueError("mode must be either 'segment' or 'embed_cells'.")
     if model_name not in SUPPORTED_MODELS:

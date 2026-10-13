@@ -781,6 +781,81 @@ class ToolAccessor:
         overwrite: bool = False,
         device: str = "cuda",
     ) -> xr.Dataset:
+        """
+        Run VirTues segmentation or cell embedding extraction.
+
+        Parameters
+        ----------
+        mode : {"segment", "embed_cells"}, optional
+            The VirTues workflow to run. ``"segment"`` stores a VirTues segmentation and cell type mask.
+            ``"embed_cells"`` stores cell-level embeddings for an existing segmentation.
+        protein_mapping : pd.DataFrame
+            A dataframe mapping image marker names to UniProt IDs.
+        marker_col : str, optional
+            Column in ``protein_mapping`` containing marker names.
+        protein_id_col : str, optional
+            Column in ``protein_mapping`` containing UniProt IDs.
+        image_key : str, optional
+            Image layer used as VirTues input.
+        model_name : str, optional
+            VirTues model name.
+        cache_dir : str, optional
+            Hugging Face cache directory used for model downloads.
+        virtues_path : str, optional
+            Local VirTues checkout to prepend to ``sys.path`` before importing VirTues.
+        quantile : float, optional
+            Per-channel image quantile used for clipping.
+        mean : pd.Series, optional
+            Dataset-level per-marker means, indexed by marker name.
+        std : pd.Series, optional
+            Dataset-level per-marker standard deviations, indexed by marker name.
+        gaussian_blur : bool, optional
+            If True, apply a Gaussian blur after standardization.
+        gaussian_blur_sigma : float, optional
+            Gaussian blur sigma.
+        store_patch_embeddings : bool, optional
+            If True, store patch embeddings and top-left crop coordinates.
+        tile_size : int, optional
+            VirTues tile size.
+        segment_overlap : int, optional
+            Tile overlap used for segmentation.
+        cell_token_stride : int, optional
+            Crop stride used for cell embedding extraction.
+        batch_size : int, optional
+            Batch size for segmentation or chunk size for cell embedding extraction.
+        segmentation_key_used : str, optional
+            Existing segmentation used for cell embedding extraction and cell type projection.
+        segmentation_key_added : str, optional
+            Key for the VirTues segmentation output.
+        cell_type_mask_key_added : str, optional
+            Key for the VirTues cell type mask output.
+        cell_type_label_key_added : str, optional
+            Label column used when projecting VirTues cell types onto an existing segmentation.
+        cell_embedding_key_added : str, optional
+            Key for the VirTues cell embedding output.
+        marker_embedding_key_added : str, optional
+            Key for marker embeddings.
+        patch_embedding_key_added : str, optional
+            Key for optional patch embeddings.
+        patch_coord_key_added : str, optional
+            Key for optional patch coordinates.
+        overwrite : bool, optional
+            If True, overwrite existing output layers.
+        device : str, optional
+            Device used for model execution. Only ``"cuda"`` is supported in v0.1.
+
+        Returns
+        -------
+        xr.Dataset
+            The updated spatialproteomics object.
+
+        Notes
+        -----
+        UniProt IDs must be supplied explicitly in ``protein_mapping``. The canonical
+        ``_segmentation`` layer is not overwritten by default; VirTues segmentation is stored under
+        ``_virtues_segmentation``. Optional VirTues dependencies are imported only when this method is
+        called.
+        """
         from .virtues import virtues
 
         return virtues(
@@ -823,6 +898,29 @@ class ToolAccessor:
         key_added: str = "_virtues_cell_embeddings",
         overwrite: bool = False,
     ) -> xr.Dataset:
+        """
+        Aggregate stored VirTues patch embeddings into cell embeddings. Follows the logic of the VirTues tutorials, 
+        where patch embeddings are assigned to segmented cells based on a weighted average 
+        with weights determined according to the number of pixels of the patch that overlap with the cell.
+
+        Parameters
+        ----------
+        patch_embedding_key : str, optional
+            The key of the stored patch embeddings.
+        patch_coord_key : str, optional
+            The key of the stored patch top-left coordinates.
+        segmentation_key : str, optional
+            The segmentation layer used to assign tokens to cells.
+        key_added : str, optional
+            The key under which aggregated cell embeddings will be stored.
+        overwrite : bool, optional
+            If True, overwrite an existing cell embedding layer.
+
+        Returns
+        -------
+        xr.Dataset
+            The updated spatialproteomics object.
+        """
         from .virtues import virtues_aggregate_patch_embeddings
 
         return virtues_aggregate_patch_embeddings(
