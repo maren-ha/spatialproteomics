@@ -847,7 +847,9 @@ class ToolAccessor:
         Returns
         -------
         xr.Dataset
-            The updated spatialproteomics object.
+            Dataset containing the original data and the requested VirTues outputs. In ``mode="segment"``,
+            this includes the VirTues segmentation and cell type mask. In ``mode="embed_cells"``, this
+            includes cell-level embeddings.
 
         Notes
         -----
@@ -919,7 +921,8 @@ class ToolAccessor:
         Returns
         -------
         xr.Dataset
-            The updated spatialproteomics object.
+            Dataset containing the original data and cell embeddings aggregated from the stored VirTues
+            patch embeddings.
         """
         from .virtues import virtues_aggregate_patch_embeddings
 

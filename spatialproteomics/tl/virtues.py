@@ -95,7 +95,7 @@ def _drop_if_overwrite(obj: xr.Dataset, key: str, overwrite: bool) -> xr.Dataset
 
 
 def validate_and_normalize_protein_mapping(
-    obj: xr.Dataset,
+    obj: xr.Dataset, # could be replaced by just channels = obj.coords[Dims.CHANNELS].values.astype(str).tolist()
     protein_mapping: pd.DataFrame,
     marker_col: str,
     protein_id_col: str,
@@ -212,6 +212,7 @@ def _download_uniprot_fasta(protein_id: str) -> str:
 
 
 def _marker_embeddings_from_layer(obj: xr.Dataset, key: str, mapping: pd.DataFrame):
+    # xr specific; would need spatialdata version
     values = obj[key]
     if values.dims[0] == Dims.CHANNELS:
         return values.sel(
@@ -225,7 +226,7 @@ def _marker_embeddings_from_layer(obj: xr.Dataset, key: str, mapping: pd.DataFra
 
 
 def add_marker_embeddings(
-    obj: xr.Dataset,
+    obj: xr.Dataset, # would need a spatialdata version
     embeddings: np.ndarray,
     mapping: pd.DataFrame,
     key_added: str,
@@ -250,7 +251,7 @@ def add_marker_embeddings(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data, marker embeddings, and marker embedding metadata.
 
     Notes
     -----
@@ -343,7 +344,8 @@ def get_or_create_marker_embeddings(
     Returns
     -------
     tuple[xr.Dataset, torch.Tensor]
-        The updated spatialproteomics object and a tensor of marker embeddings in mapping order.
+        Dataset containing the original data and marker embeddings, and a tensor of marker embeddings
+        in mapping order.
 
     Raises
     ------
@@ -414,7 +416,7 @@ def _resolve_mean_std(mean: Optional[pd.Series],
 
 
 def preprocess_for_virtues(
-    obj: xr.Dataset,
+    obj: xr.Dataset, # could use image instead
     mapping: pd.DataFrame,
     image_key: str,
     quantile: float = 0.99,
@@ -468,9 +470,7 @@ def preprocess_for_virtues(
     image_layer = obj[image_key]
     expected_dims = [Dims.CHANNELS, Dims.Y, Dims.X]
     if list(image_layer.dims) != expected_dims:
-        raise ValueError(
-            f"Image layer {image_key!r} must have dimensions {expected_dims}; found {list(image_layer.dims)}."
-        )
+        raise ValueError(f"Image layer {image_key!r} must have dimensions {expected_dims}; found {list(image_layer.dims)}.")
 
     # subset to markers from the mapping table and convert to numpy array
     image = (obj[image_key].sel({Dims.CHANNELS: markers}).values.astype(np.float32, copy=True))
@@ -578,7 +578,7 @@ def load_virtues_model(marker_embeddings, model_name: str, cache_dir=None, virtu
 
 
 def add_patch_embeddings(
-    obj: xr.Dataset,
+    obj: xr.Dataset, # would need spatialdata version
     patch_embeddings: np.ndarray,
     patch_coords_yx: np.ndarray,
     patch_embedding_key_added: str,
@@ -609,7 +609,7 @@ def add_patch_embeddings(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data, patch embeddings, and patch top-left coordinates.
 
     Notes
     -----
@@ -725,7 +725,7 @@ def add_virtues_segmentation_outputs(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data, VirTues segmentation, and VirTues cell type mask.
 
     Notes
     -----
@@ -787,7 +787,7 @@ def add_virtues_embedding_outputs(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data and VirTues cell embeddings aligned to ``cells``.
 
     Notes
     -----
@@ -852,7 +852,8 @@ def virtues_aggregate_patch_embeddings(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data and cell embeddings aggregated from the stored VirTues
+        patch embeddings.
 
     Notes
     -----
@@ -977,7 +978,7 @@ def project_virtues_cell_types_to_existing_segmentation(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data and a ``_la_layers`` column with projected VirTues cell types.
 
     Notes
     -----
@@ -1092,7 +1093,8 @@ def run_virtues_segmentation(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data, VirTues segmentation, and VirTues cell type mask.
+        If requested, it also contains patch embeddings and patch top-left coordinates.
     """
     try:
         from virtues.utils.segmentation import assign_cell_types
@@ -1286,7 +1288,8 @@ def run_virtues_cell_embedding(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data and VirTues cell embeddings. If requested, it also contains
+        patch embeddings and patch top-left coordinates.
     """
     if segmentation_key_used not in obj:
         raise ValueError(f"mode='embed_cells' requires an existing segmentation layer {segmentation_key_used!r}.")
@@ -1489,7 +1492,9 @@ def virtues(
     Returns
     -------
     xr.Dataset
-        The updated spatialproteomics object.
+        Dataset containing the original data and the requested VirTues outputs. In ``mode="segment"``,
+        this includes the VirTues segmentation and cell type mask. In ``mode="embed_cells"``, this
+        includes cell-level embeddings.
 
     Notes
     -----
