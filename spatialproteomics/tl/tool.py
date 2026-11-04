@@ -770,10 +770,8 @@ class ToolAccessor:
         segment_overlap: int = 32,
         cell_token_stride: int = 42,
         batch_size=None,
-        segmentation_key_used: str = Layers.SEGMENTATION,
-        segmentation_key_added: str = "_virtues_segmentation",
-        cell_type_mask_key_added: str = "_virtues_cell_type_mask",
-        cell_type_label_key_added: str = "_virtues_cell_type",
+        segmentation_key_added: str = Layers.SEGMENTATION,
+        cell_type_prediction_key_added: Optional[str] = None,
         cell_embedding_key_added: str = "_virtues_cell_embeddings",
         marker_embedding_key_added: str = "_virtues_marker_embeddings",
         patch_embedding_key_added: str = "_virtues_patch_embeddings",
@@ -787,7 +785,7 @@ class ToolAccessor:
         Parameters
         ----------
         mode : {"segment", "embed_cells"}, optional
-            The VirTues workflow to run. ``"segment"`` stores a VirTues segmentation and cell type mask.
+            The VirTues workflow to run. ``"segment"`` stores a segmentation and optional pixel-wise cell type predictions.
             ``"embed_cells"`` stores cell-level embeddings for an existing segmentation.
         protein_mapping : pd.DataFrame
             A dataframe mapping image marker names to UniProt IDs.
@@ -818,19 +816,23 @@ class ToolAccessor:
         tile_size : int, optional
             VirTues tile size.
         segment_overlap : int, optional
-            Tile overlap used for segmentation.
+            Overlap parameter in pixels for mode="segment"; defaults to 32. VirTues requests
+            a total crop overlap of 2 * segment_overlap for images whose longest side is at most
+            1500 pixels, and 2 * (segment_overlap + 20) for larger images, including a detection
+            margin. In the latter case, segment_overlap also controls the instance-stitching offset.
+            For tile_size=128 and segment_overlap=32, nominal crop strides are 64 and 24 pixels,
+            respectively. More overlap increases the number of crops and computation.
         cell_token_stride : int, optional
             Crop stride used for cell embedding extraction.
         batch_size : int, optional
             Batch size for segmentation or chunk size for cell embedding extraction.
-        segmentation_key_used : str, optional
-            Existing segmentation used for cell embedding extraction and cell type projection.
         segmentation_key_added : str, optional
-            Key for the VirTues segmentation output.
-        cell_type_mask_key_added : str, optional
-            Key for the VirTues cell type mask output.
-        cell_type_label_key_added : str, optional
-            Label column used when projecting VirTues cell types onto an existing segmentation.
+            Key for the VirTues segmentation output; defaults to canonical "_segmentation".
+        cell_type_prediction_key_added : str or None, optional
+            Store pixel-wise class predictions under this key; None skips prediction storage.
+            Predictions suppress "None" and "Unknown" before argmax and are not assigned to VirTues cells
+            or set to background outside them. Assign predictions to canonical cells explicitly with
+            project_virtues_cell_types_to_existing_segmentation().
         cell_embedding_key_added : str, optional
             Key for the VirTues cell embedding output.
         marker_embedding_key_added : str, optional
@@ -840,7 +842,7 @@ class ToolAccessor:
         patch_coord_key_added : str, optional
             Key for optional patch coordinates.
         overwrite : bool, optional
-            If True, overwrite existing output layers.
+            If True, overwrite custom output layers. An existing canonical segmentation cannot be replaced.
         device : str, optional
             Device used for model execution. Only ``"cuda"`` is supported in v0.1.
 
@@ -848,55 +850,150 @@ class ToolAccessor:
         -------
         xr.Dataset
             Dataset containing the original data and the requested VirTues outputs. In ``mode="segment"``,
-            this includes the VirTues segmentation and cell type mask. In ``mode="embed_cells"``, this
+            this includes the segmentation and pixel-wise cell type predictions only when requested. In ``mode="embed_cells"``, this
             includes cell-level embeddings.
 
         Notes
         -----
-        UniProt IDs must be supplied explicitly in ``protein_mapping``. The canonical
-        ``_segmentation`` layer is not overwritten by default; VirTues segmentation is stored under
-        ``_virtues_segmentation``. Optional VirTues dependencies are imported only when this method is
-        called.
-        """
-        from .virtues import virtues
+        UniProt IDs must be supplied explicitly in ``protein_mapping``. Optional VirTues dependencies
+        are imported only when this method is called.
 
-        return virtues(
-            self._obj,
-            mode=mode,
-            protein_mapping=protein_mapping,
-            marker_col=marker_col,
-            protein_id_col=protein_id_col,
-            image_key=image_key,
-            model_name=model_name,
-            cache_dir=cache_dir,
-            virtues_path=virtues_path,
+        In mode="segment", segmentation_key_added defaults to "_segmentation". Writing to this key
+        establishes canonical cell IDs and geometric observations. If "_segmentation" already exists,
+        the call raises an error even when overwrite=True; use a different output key for an alternative mask.
+
+        A custom segmentation key stores only an image-shaped mask. It does not change canonical
+        segmentation, cell IDs, or observations, and does not establish cells when no canonical segmentation
+        exists. An existing custom output can be replaced with overwrite=True.
+
+        Pixel-wise cell type predictions are stored only when cell_type_prediction_key_added is supplied. Segmentation never
+        automatically adds cell type annotations. Cell embedding extraction always uses canonical cells.
+        """
+        from .virtues_utils import _virtues, validate_and_normalize_protein_mapping
+        from .virtues_backends import (
+            _get_stored_virtues_marker_embeddings,
+            _get_virtues_canonical_segmentation,
+            _validate_virtues_arguments,
+            add_marker_embeddings,
+            add_virtues_segmentation_outputs,
+            add_virtues_embedding_outputs,
+            add_patch_embeddings,
+        )
+
+        obj = self._obj
+        _validate_virtues_arguments(
+            obj, 
+            mode, 
+            image_key, 
+            store_patch_embeddings, 
+            segmentation_key_added, 
+            cell_type_prediction_key_added,
+            cell_embedding_key_added, 
+            marker_embedding_key_added, 
+            patch_embedding_key_added, 
+            patch_coord_key_added, 
+            overwrite,
+        )
+        channels = obj.coords[Dims.CHANNELS].values.astype(str).tolist()
+        mapping = validate_and_normalize_protein_mapping(
+            channels, 
+            protein_mapping, 
+            marker_col, 
+            protein_id_col, 
+            model_name
+        )
+        marker_embeddings = _get_stored_virtues_marker_embeddings(
+            obj, 
+            mapping, 
+            marker_embedding_key_added, 
+            overwrite=overwrite
+        )
+        segmentation = _get_virtues_canonical_segmentation(obj)[0] if mode == "embed_cells" else None
+
+        image = obj[image_key].sel({Dims.CHANNELS: mapping["marker_name"].tolist()}).values
+
+        result = _virtues(
+            image, 
+            mapping, 
+            mode=mode, 
+            segmentation=segmentation, 
+            marker_embeddings=marker_embeddings,
+            model_name=model_name, 
+            cache_dir=cache_dir, 
+            virtues_path=virtues_path, 
             quantile=quantile,
-            mean=mean,
-            std=std,
-            gaussian_blur=gaussian_blur,
+            mean=mean, 
+            std=std, 
+            gaussian_blur=gaussian_blur, 
             gaussian_blur_sigma=gaussian_blur_sigma,
-            store_patch_embeddings=store_patch_embeddings,
-            tile_size=tile_size,
-            segment_overlap=segment_overlap,
+            tile_size=tile_size, 
+            segment_overlap=segment_overlap, 
             cell_token_stride=cell_token_stride,
-            batch_size=batch_size,
-            segmentation_key_used=segmentation_key_used,
-            segmentation_key_added=segmentation_key_added,
-            cell_type_mask_key_added=cell_type_mask_key_added,
-            cell_type_label_key_added=cell_type_label_key_added,
-            cell_embedding_key_added=cell_embedding_key_added,
-            marker_embedding_key_added=marker_embedding_key_added,
-            patch_embedding_key_added=patch_embedding_key_added,
-            patch_coord_key_added=patch_coord_key_added,
-            overwrite=overwrite,
+            batch_size=batch_size, 
+            return_cell_type_prediction=(mode == "segment" and cell_type_prediction_key_added is not None),
+            return_patch_embeddings=store_patch_embeddings, 
             device=device,
         )
+        outputs = result["outputs"]
+
+        if result["new_marker_embeddings"] is not None:
+            obj = add_marker_embeddings(
+                obj, 
+                result["new_marker_embeddings"], 
+                mapping, 
+                marker_embedding_key_added, 
+                overwrite=overwrite
+            )
+
+        if mode == "segment":
+            attrs = {
+                **outputs["segmentation_metadata"], 
+                "image_key": image_key
+            }
+            obj = add_virtues_segmentation_outputs(
+                obj, 
+                outputs["segmentation"], 
+                outputs["cell_type_prediction"], 
+                segmentation_key_added,
+                cell_type_prediction_key_added, 
+                attrs, 
+                overwrite=overwrite,
+            )
+        else:
+            attrs = {
+                **outputs["cell_embedding_metadata"], 
+                "image_key": image_key, 
+                "segmentation_key_used": Layers.SEGMENTATION
+            }
+            obj = add_virtues_embedding_outputs(
+                obj, 
+                outputs["cell_ids"], 
+                outputs["cell_embeddings"], 
+                cell_embedding_key_added, 
+                attrs, 
+                overwrite=overwrite
+            )
+
+        if store_patch_embeddings:
+            attrs = {
+                **outputs["patch_metadata"], 
+                "image_key": image_key
+            }
+            obj = add_patch_embeddings(
+                obj, 
+                outputs["patch_embeddings"], 
+                outputs["patch_coords_yx"], 
+                patch_embedding_key_added,
+                patch_coord_key_added, 
+                attrs, 
+                overwrite=overwrite,
+            )
+        return obj
 
     def virtues_aggregate_patch_embeddings(
         self,
         patch_embedding_key: str = "_virtues_patch_embeddings",
         patch_coord_key: str = "_virtues_patch_coords",
-        segmentation_key: str = Layers.SEGMENTATION,
         key_added: str = "_virtues_cell_embeddings",
         overwrite: bool = False,
     ) -> xr.Dataset:
@@ -911,10 +1008,8 @@ class ToolAccessor:
             The key of the stored patch embeddings.
         patch_coord_key : str, optional
             The key of the stored patch top-left coordinates.
-        segmentation_key : str, optional
-            The segmentation layer used to assign tokens to cells.
         key_added : str, optional
-            The key under which aggregated cell embeddings will be stored.
+            The key under which aggregated embeddings of canonical "_segmentation" cells will be stored.
         overwrite : bool, optional
             If True, overwrite an existing cell embedding layer.
 
@@ -923,17 +1018,124 @@ class ToolAccessor:
         xr.Dataset
             Dataset containing the original data and cell embeddings aggregated from the stored VirTues
             patch embeddings.
-        """
-        from .virtues import virtues_aggregate_patch_embeddings
 
-        return virtues_aggregate_patch_embeddings(
-            self._obj,
-            patch_embedding_key=patch_embedding_key,
-            patch_coord_key=patch_coord_key,
-            segmentation_key=segmentation_key,
-            key_added=key_added,
-            overwrite=overwrite,
+        Notes
+        -----
+        Aggregation always targets canonical "_segmentation" cells; alternate masks do not define cells.
+        Each token contributes to every overlapping cell, weighted by the number of overlapping pixels.
+        """
+        from .virtues_utils import TOKEN_PATCH_SIZE_PX, _virtues_aggregate_patch_embeddings
+        from .virtues_backends import (
+            VIRTUES_PATCHES_DIM, TOKEN_Y_DIM, TOKEN_X_DIM, VIRTUES_EMBEDDING_DIM, YX_DIM,
+            _check_key_available,
+            _get_virtues_canonical_segmentation,
+            add_virtues_embedding_outputs,
         )
+
+        obj = self._obj
+
+        for key in [patch_embedding_key, patch_coord_key]:
+            if key not in obj:
+                raise KeyError(f"Layer {key!r} not found.")
+        _check_key_available(obj, key_added, overwrite)
+        if key_added == Layers.SEGMENTATION:
+            raise ValueError("Cell embeddings cannot replace canonical segmentation.")
+
+        segmentation, cells = _get_virtues_canonical_segmentation(obj)
+
+        # get patch embeddings and coordinates and validate their dimensions and attributes
+        patch_da = obj[patch_embedding_key]
+        coords_da = obj[patch_coord_key]
+        if patch_da.dims != (VIRTUES_PATCHES_DIM, TOKEN_Y_DIM, TOKEN_X_DIM, VIRTUES_EMBEDDING_DIM):
+            raise ValueError("Patch embeddings must use crop, token_y, token_x, and embedding dimensions.")
+        if coords_da.dims != (VIRTUES_PATCHES_DIM, YX_DIM) or coords_da.coords[YX_DIM].values.tolist() != ["y", "x"]:
+            raise ValueError("Patch coordinates must use [crop, yx] dimensions in top-left (y, x) order.")
+        if coords_da.attrs.get("paired_embedding_key", patch_embedding_key) != patch_embedding_key:
+            raise ValueError("Patch coordinates are paired with a different embedding key.")
+
+        required_attrs = [
+            "tile_size_px",
+            "token_patch_size_px",
+            "token_stride_px",
+        ]
+        missing_attrs = [attr for attr in required_attrs if attr not in patch_da.attrs]
+        if missing_attrs:
+            raise ValueError(f"Patch embeddings are missing required attrs: {missing_attrs}.")
+
+        if patch_da.attrs["token_patch_size_px"] != TOKEN_PATCH_SIZE_PX or patch_da.attrs["token_stride_px"] != TOKEN_PATCH_SIZE_PX:
+            raise ValueError("Stored token geometry must match the fixed 8-pixel VirTues token size and stride.")
+
+        values = _virtues_aggregate_patch_embeddings(
+            patch_da.values, 
+            coords_da.values, 
+            segmentation, 
+            cells, 
+            patch_da.attrs["tile_size_px"],
+        )
+        attrs = {
+            "source": f"aggregate:{patch_da.attrs.get('source', 'unknown')}",
+            "patch_embedding_key": patch_embedding_key,
+            "patch_coord_key": patch_coord_key,
+            "segmentation_key": Layers.SEGMENTATION,
+        }
+        return add_virtues_embedding_outputs(
+            obj, 
+            cells, 
+            values, 
+            key_added, 
+            attrs, 
+            overwrite=overwrite
+        )
+
+    def project_virtues_cell_types_to_existing_segmentation(
+        self,
+        cell_type_prediction: np.ndarray,
+        cell_type_label_key_added: str = "_virtues_cell_type",
+        overwrite: bool = False,
+    ) -> xr.Dataset:
+        """
+        Project VirTues cell type predictions onto an existing segmentation.
+
+        Parameters
+        ----------
+        cell_type_prediction : np.ndarray
+            Pixel-wise VirTues class predictions before assignment to an instance segmentation.
+        cell_type_label_key_added : str, optional
+            The column added to ``_la_layers``.
+        overwrite : bool, optional
+            If True, overwrite an existing label layer column with the same name.
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset containing the original data and a ``_la_layers`` column with projected VirTues cell types.
+
+        Notes
+        -----
+        Projection is explicit and always targets canonical "_segmentation" cells. To annotate another
+        segmentation population, first make that segmentation canonical in a separate object.
+        For each existing cell, the assigned VirTues cell type is the most frequent value of
+        ``cell_type_prediction`` under that cell's segmentation mask. Use the pixel-wise predictions rather
+        than a mask already assigned to VirTues cells. All supplied class IDs participate, including 0
+        if present. Ties follow ``np.bincount(...).argmax()``
+        and therefore choose the lowest tied integer cell type ID.
+        """
+        from .virtues_backends import _get_virtues_canonical_segmentation
+        from .virtues_utils import _project_virtues_cell_types_to_segmentation
+
+        obj = self._obj
+        segmentation, cells = _get_virtues_canonical_segmentation(obj)
+        if Layers.LA_LAYERS in obj:
+            existing = obj[Layers.LA_LAYERS].to_pandas()
+            if cell_type_label_key_added in existing.columns and not overwrite:
+                raise ValueError(f"Label layer column {cell_type_label_key_added} already exists.")
+        else:
+            existing = pd.DataFrame(index=cells)
+        cell_types = _project_virtues_cell_types_to_segmentation(cell_type_prediction, segmentation, cells)
+        existing[cell_type_label_key_added] = pd.Series(cell_types, index=cells)
+        if Layers.LA_LAYERS in obj:
+            obj = obj.drop_vars(Layers.LA_LAYERS)
+        return obj.pp.add_layer_from_dataframe(existing, key_added=Layers.LA_LAYERS)
 
     def convert_to_anndata(
         self,
