@@ -334,8 +334,8 @@ def preprocess_for_virtues(
     return image, attrs
 
 
-def load_virtues_model(marker_embeddings, model_name: str, cache_dir=None, virtues_path=None, device: str = "cuda", load_segmentation_head: bool = True):
-    """Load the backbone from NumPy priors and optionally load its segmentation head.
+def load_virtues_model(marker_embeddings, model_name: str, cache_dir=None, virtues_path=None, device: str = "cuda", load_segmentation_head: bool = False):
+    """Load the VirTues model backbone and optionally load its segmentation head.
 
     Returns (backbone, head), with head=None when segmentation components are not requested.
     """

@@ -843,6 +843,7 @@ class ToolAccessor:
             Key for optional patch coordinates.
         overwrite : bool, optional
             If True, overwrite custom output layers. An existing canonical segmentation cannot be replaced.
+            Stored ESM marker priors are always recomputed and replaced when True, even if their metadata matches.
         device : str, optional
             Device used for model execution. Only ``"cuda"`` is supported in v0.1.
 

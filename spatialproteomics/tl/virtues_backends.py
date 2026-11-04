@@ -147,9 +147,12 @@ def _get_stored_virtues_marker_embeddings(
 ) -> Optional[np.ndarray]:
     """Return matching stored priors in mapping order, or None when new priors are needed.
 
-    Incompatible stored priors raise unless overwrite permits computing a replacement. Lookup never
-    modifies the dataset, computes priors, or imports optional model dependencies.
+    overwrite=True bypasses stored priors so the shared workflow computes fresh priors. Otherwise,
+    incompatible stored priors raise. Lookup never modifies the dataset, computes priors, or imports
+    optional model dependencies.
     """
+    if overwrite:
+        return None
     if marker_embedding_key in obj:
         layer = obj[marker_embedding_key]
         metadata_matches = (
@@ -161,11 +164,10 @@ def _get_stored_virtues_marker_embeddings(
         if metadata_matches:
             embeddings = _marker_embeddings_from_layer(obj, marker_embedding_key, mapping)
             return embeddings
-        if not overwrite:
-            raise ValueError(
-                f"Marker embedding layer {marker_embedding_key!r} exists but metadata does not match the "
-                "requested protein mapping. Use overwrite=True or choose another key."
-            )
+        raise ValueError(
+            f"Marker embedding layer {marker_embedding_key!r} exists but metadata does not match the "
+            "requested protein mapping. Use overwrite=True or choose another key."
+        )
 
     return None
 
