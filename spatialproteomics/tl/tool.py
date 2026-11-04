@@ -19,7 +19,8 @@ from .utils import (
     _compute_transformation,
     _convert_masks_to_data_array,
     _get_channels,
-    _mesmer,
+    _instanseg,
+    _instanseg_keys,
     _spotiflow,
     _stardist,
 )
@@ -60,7 +61,13 @@ def cellpose(
     channels = _get_channels_spatialdata(channel)
 
     # assert that the format is correct and extract the image
-    image = _process_image(sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key)
+    image = _process_image(
+        sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key, return_values=False
+    )
+    # if no channel is specified, all channels are segmented
+    if channels is None:
+        channels = image.coords["c"].values.tolist()
+    image = image.values
 
     # run cellpose
     segmentation_masks, _ = _cellpose(image, **kwargs)
@@ -119,7 +126,13 @@ def stardist(
     channels = _get_channels_spatialdata(channel)
 
     # assert that the format is correct and extract the image
-    image = _process_image(sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key)
+    image = _process_image(
+        sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key, return_values=False
+    )
+    # if no channel is specified, all channels are segmented
+    if channels is None:
+        channels = image.coords["c"].values.tolist()
+    image = image.values
 
     # run stardist
     segmentation_masks = _stardist(image, **kwargs)
@@ -144,6 +157,63 @@ def stardist(
         return sdata
 
 
+def instanseg(
+    sdata,
+    channel: Optional[str] = None,
+    image_key: str = SDLayers.IMAGE,
+    key_added: str = SDLayers.SEGMENTATION,
+    data_key: Optional[str] = None,
+    copy: bool = False,
+    **kwargs,
+):
+    """
+    This function runs the InstanSeg segmentation algorithm on the provided image data.
+    It extracts the image data from the spatialdata object, applies InstanSeg,
+    and adds the segmentation masks to the labels attribute of the spatialdata object.
+    In contrast to cellpose and stardist, InstanSeg is channel-invariant, i. e. all selected channels are segmented jointly
+    and a single segmentation mask is returned.
+
+    Args:
+        sdata (spatialdata.SpatialData): The spatialdata object containing the image data.
+        channel (Optional[str]): The channel(s) to be used for segmentation. If None, all channels will be used.
+        image_key (str, optional): The key for the image data in the spatialdata object. Defaults to image.
+        key_added (str, optional): The key under which the segmentation mask will be stored in the labels attribute of the spatialdata object. If target="all_outputs", the cell mask is stored under key_added and the nuclear mask under f"{key_added}_nuclei". Defaults to segmentation.
+        data_key (Optional[str], optional): The key for the image data in the spatialdata object. If None, the image_key will be used. Defaults to None.
+        copy (bool, optional): Whether to create a copy of the spatialdata object. Defaults to False.
+        **kwargs: Additional keyword arguments passed to the InstanSeg wrapper, e.g. model_type, pixel_size, target, method or device (see ToolAccessor.instanseg).
+    """
+    import spatialdata
+    from spatialdata.transformations import get_transformation, set_transformation
+
+    if copy:
+        sdata = cp.deepcopy(sdata)
+
+    channels = _get_channels_spatialdata(channel)
+
+    # assert that the format is correct and extract the image
+    image = _process_image(sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key)
+
+    # run instanseg
+    segmentation_masks = _instanseg(image, **kwargs)
+    keys = _instanseg_keys(segmentation_masks, key_added)
+
+    for key in keys.values():
+        assert (
+            key not in sdata.labels.keys()
+        ), f"Key {key} already exists in spatial data object. Please choose another key."
+
+    # get transformations
+    transformation = get_transformation(sdata[image_key])
+
+    # add the segmentation masks to the spatial data object
+    for name, mask in segmentation_masks.items():
+        sdata.labels[keys[name]] = spatialdata.models.Labels2DModel.parse(mask, transformations=None, dims=("y", "x"))
+        set_transformation(sdata.labels[keys[name]], transformation)
+
+    if copy:
+        return sdata
+
+
 def mesmer(
     sdata,
     channel: Optional[str] = None,
@@ -154,50 +224,13 @@ def mesmer(
     **kwargs,
 ):
     """
-    This function runs the mesmer segmentation algorithm on the provided image data.
-    It extracts the image data from the spatialdata object, applies the mesmer algorithm,
-    and adds the segmentation masks to the spatialdata object.
-    The segmentation masks are stored in the labels attribute of the spatialdata object.
-    The first channel is assumed to be nuclear and the second one membraneous.
-
-    Args:
-        sdata (spatialdata.SpatialData): The spatialdata object containing the image data.
-        channel (Optional[str]): The channel(s) to be used for segmentation.
-        image_key (str, optional): The key for the image data in the spatialdata object. Defaults to image.
-        key_added (str, optional): The key under which the segmentation masks will be stored in the labels attribute of the spatialdata object. Defaults to segmentation.
-        data_key (Optional[str], optional): The key for the image data in the spatialdata object. If None, the image_key will be used. Defaults to None.
-        copy (bool, optional): Whether to create a copy of the spatialdata object. Defaults to False.
-        **kwargs: Additional keyword arguments to be passed to the mesmer algorithm.
+    This function is deprecated and will be removed in a future version of spatialproteomics.
     """
-    import spatialdata
-    from spatialdata.transformations import get_transformation, set_transformation
-
-    if copy:
-        sdata = cp.deepcopy(sdata)
-
-    channels = _get_channels_spatialdata(channel)
-
-    assert (
-        len(channels) == 2
-    ), "Mesmer only supports two channel segmentation. Please ensure that the first channel is nuclear and the second one is membraneous."
-
-    # assert that the format is correct and extract the image
-    image = _process_image(sdata, channels=channels, image_key=image_key, key_added=key_added, data_key=data_key)
-
-    # run mesmer
-    segmentation_masks = _mesmer(image, **kwargs)
-
-    # get transformations
-    transformation = get_transformation(sdata[image_key])
-
-    # add the segmentation masks to the spatial data object
-    sdata.labels[key_added] = spatialdata.models.Labels2DModel.parse(
-        segmentation_masks[0].squeeze(), transformations=None, dims=("y", "x")
+    raise DeprecationWarning(
+        "Since it relied on python<=3.10, which has reached its end of life in October 2026, "
+        "the mesmer function is deprecated and will be removed in a future version of spatialproteomics. "
+        "Please use the cellpose, stardist or instanseg functions for segmentation instead."
     )
-    set_transformation(sdata.labels[key_added], transformation)
-
-    if copy:
-        return sdata
 
 
 def astir(
@@ -259,10 +292,9 @@ def astir(
         **kwargs,
     )
 
-    # merging the resulting dataframe to the adata object
-    df = pd.DataFrame(adata.obs)
-    df = df.merge(assigned_cell_types, left_on="id", right_on=cell_id_col, how="left")
-    adata.obs = df.drop(columns=cell_id_col)
+    # adding the predicted cell types to the adata object (the cell ids are the obs_names of the expression matrix)
+    cell_types = assigned_cell_types.set_index(cell_id_col)[cell_type_col]
+    adata.obs[cell_type_col] = cell_types.reindex(adata.obs_names).values
 
     if copy:
         return sdata
@@ -314,7 +346,11 @@ def spotiflow(
         sdata = cp.deepcopy(sdata)
 
     channels = _get_channels_spatialdata(channel)
-    img = _process_image(sdata, channels=channel, image_key=image_key, key_added=None)
+    img = _process_image(sdata, channels=channel, image_key=image_key, key_added=None, return_values=False)
+    # if no channel is specified, spots are detected in all channels
+    if channels is None:
+        channels = img.coords["c"].values.tolist()
+    img = img.values
     adata = _process_adata(sdata, table_key=table_key)
 
     points_df = _spotiflow(
@@ -534,6 +570,104 @@ class ToolAccessor:
 
         return xr.merge([self._obj, da], join="outer", compat="no_conflicts")
 
+    def instanseg(
+        self,
+        channel: Optional[str] = None,
+        key_added: str = Layers.SEGMENTATION,
+        model_type: str = "fluorescence_nuclei_and_cells",
+        pixel_size: Optional[float] = None,
+        target: str = "cells",
+        normalize: bool = True,
+        method: str = "auto",
+        tile_size: int = 512,
+        batch_size: int = 1,
+        device: Optional[str] = None,
+        verbosity: int = 1,
+        postprocess_func: Callable = lambda x: x,
+        **kwargs,
+    ) -> xr.Dataset:
+        """
+        Apply InstanSeg (https://github.com/instanseg/instanseg) to perform instance segmentation of nuclei and/or cells.
+
+        InstanSeg is channel-invariant, so in contrast to cellpose and stardist, all selected channels are segmented jointly
+        and a single segmentation mask is returned (e. g. a nuclear marker together with membrane markers).
+        Requires `pip install instanseg-torch`.
+
+        Parameters
+        ----------
+        channel : str or list, optional
+            Channel(s) to use for segmentation. If None, all channels are used.
+        key_added : str, optional
+            Key to write the segmentation results to. If target is "all_outputs", the cell mask is written to key_added
+            and the nuclear mask to f"{key_added}_nuclei".
+        model_type : str, optional
+            Name of the pretrained InstanSeg model, e. g. "fluorescence_nuclei_and_cells" (default) or "brightfield_nuclei".
+        pixel_size : float, optional
+            Pixel size of the image in microns. The image is rescaled to the pixel size the model was trained on (0.5 microns
+            for the default model). If None, the image is not rescaled, which may lead to inaccurate results.
+        target : str, optional
+            Which segmentation to return: "cells" (default), "nuclei" or "all_outputs" (both). Models that only predict nuclei
+            always return the nuclear segmentation.
+        normalize : bool, optional
+            Whether InstanSeg should percentile-normalize the image (default is True).
+        method : str, optional
+            "small" processes the whole image at once, "medium" uses tiled inference. "auto" (default) picks "medium" for large images.
+        tile_size : int, optional
+            Tile size for tiled inference (default is 512). Only used if method is "medium".
+        batch_size : int, optional
+            Number of tiles processed simultaneously (default is 1). Only used if method is "medium".
+        device : str, optional
+            Device to run the model on, e. g. "cpu" or "cuda". If None, the device is chosen automatically.
+        verbosity : int, optional
+            Verbosity of InstanSeg: 0 is silent, 1 is normal, 2 is verbose (default is 1).
+        postprocess_func : Callable, optional
+            Function to apply to each segmentation mask after prediction (default is lambda x: x).
+        **kwargs : dict, optional
+            Additional keyword arguments passed to InstanSeg's eval_small_image or eval_medium_image.
+
+        Returns
+        -------
+        xr.Dataset
+            Xarray dataset containing the segmentation mask(s).
+
+        Raises
+        ------
+        KeyError
+            If the key the segmentation should be written to already exists.
+        """
+        channels = _get_channels(self._obj, key_added, channel)
+
+        masks = _instanseg(
+            self._obj.pp[channels]._image.values,
+            model_type=model_type,
+            pixel_size=pixel_size,
+            target=target,
+            normalize=normalize,
+            method=method,
+            tile_size=tile_size,
+            batch_size=batch_size,
+            device=device,
+            verbosity=verbosity,
+            postprocess_func=postprocess_func,
+            **kwargs,
+        )
+        keys = _instanseg_keys(masks, key_added)
+
+        for key in keys.values():
+            if key in self._obj:
+                raise KeyError(f'The key "{key}" already exists. Please choose another key.')
+
+        obj = self._obj
+        # adding the default segmentation last, so that it is not overwritten by merging the other masks
+        for name in sorted(masks, key=lambda n: keys[n] == Layers.SEGMENTATION):
+            if keys[name] == Layers.SEGMENTATION:
+                obj = obj.pp.add_segmentation(masks[name])
+            else:
+                da = _convert_masks_to_data_array(obj, masks[name], keys[name])
+                obj = xr.merge([obj, da], join="outer", compat="no_conflicts")
+
+        return obj
+
     def mesmer(
         self,
         key_added: str = Layers.SEGMENTATION,
@@ -542,48 +676,13 @@ class ToolAccessor:
         **kwargs,
     ):
         """
-        Segment cells using Mesmer. Adds a layer to the spatialproteomics object
-        with dimension (C, X, Y). Assumes C is two and has the order (nuclear, membrane).
-
-        Parameters
-        ----------
-        key_added : str, optional
-            Key to assign to the segmentation results.
-        channel : List, optional
-            Channel to use for segmentation. If None, all channels are used.
-        postprocess_func : Callable, optional
-            Function to apply to the segmentation masks after prediction.
-
-        Returns
-        -------
-        xr.Dataset
-            Dataset containing original data and segmentation mask.
-
-        Notes
-        -----
-        This method requires the 'mesmer' package to be installed.
+        This function is deprecated.
         """
-        channels = _get_channels(self._obj, key_added, channel)
-
-        assert (
-            len(channels) == 2
-        ), "Mesmer only supports two channels for segmentation. If two channels are provided, the first channel is assumed to be the nuclear channel and the second channel is assumed to be the membrane channel. You can set the channels using the 'channel' argument."
-
-        all_masks = _mesmer(self._obj.pp[channels]._image.values, postprocess_func=postprocess_func, **kwargs)
-
-        if all_masks.shape[0] == 1:
-            all_masks = all_masks[0].squeeze()
-        # if we segment on all of the channels, we need to add the channel dimension
-        else:
-            all_masks = np.stack(all_masks, 0)
-
-        # if no segmentation exists yet, and no key_added was specified, we make this one the default
-        if key_added == Layers.SEGMENTATION:
-            return self._obj.pp.add_segmentation(all_masks)
-
-        da = _convert_masks_to_data_array(self._obj, all_masks, key_added)
-
-        return xr.merge([self._obj, da], join="outer", compat="no_conflicts")
+        raise DeprecationWarning(
+            "Since it relied on python<=3.10, which has reached its end of life in October 2026, "
+            "the mesmer function is deprecated and will be removed in a future version of spatialproteomics. "
+            "Please use the cellpose, stardist or instanseg functions for segmentation instead."
+        )
 
     def astir(
         self,
@@ -627,6 +726,8 @@ class ToolAccessor:
             Column name for cell IDs. Defaults to "cell_id".
         cell_type_col : str, optional
             Column name for cell types. Defaults to "cell_type".
+        **kwargs
+            Additional keyword arguments passed to astir's fit_type method.
 
         Raises
         ------
@@ -641,7 +742,7 @@ class ToolAccessor:
         # check if there is an expression matrix
         if key not in self._obj:
             raise ValueError(
-                f"No expression matrix with key {key} found in the object. Make sure to call pp.quantify first."
+                f"No expression matrix with key {key} found in the object. Make sure to call pp.add_quantification first."
             )
 
         # raise an error if the image is of anything other than uint8
@@ -672,6 +773,7 @@ class ToolAccessor:
             max_epochs=max_epochs,
             cell_id_col=cell_id_col,
             cell_type_col=cell_type_col,
+            **kwargs,
         )
 
         # adding the labels to the xarray object
@@ -1272,12 +1374,12 @@ class ToolAccessor:
 
         markers = self._obj.coords[Dims.CHANNELS].values
         image = spatialdata.models.Image2DModel.parse(
-            self._obj[image_key].values, transformations=None, dims=("c", "x", "y"), c_coords=markers
+            self._obj[image_key].values, transformations=None, dims=("c", "y", "x"), c_coords=markers
         )
         if Dims.CELLS in self._obj.coords:
             cells = self._obj.coords[Dims.CELLS].values
             segmentation = spatialdata.models.Labels2DModel.parse(
-                self._obj[segmentation_key].values, transformations=None, dims=("x", "y")
+                self._obj[segmentation_key].values, transformations=None, dims=("y", "x")
             )
             store_segmentation = True
 

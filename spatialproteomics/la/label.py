@@ -9,7 +9,6 @@ from skimage.segmentation import relabel_sequential
 
 from ..base_logger import logger
 from ..constants import (
-    COLORS,
     Dims,
     Features,
     Labels,
@@ -24,6 +23,8 @@ from ..la.utils import (
     _predict_cell_subtypes,
     _predict_cell_types_argmax,
 )
+from ..pl.utils import _sample_colors
+from ..pp.utils import _ids_in_slice, _select_cells
 from ..sd.utils import _process_adata
 
 
@@ -150,6 +151,11 @@ def predict_cell_subtypes(
     # we need to do a copy here, because otherwise this returns a slice of a dataframe, which can have unintended consequences
     binarization_df = adata.obsm[layer_key].copy()
 
+    # if the subtype dict is a path to a yaml file, we load it
+    if isinstance(subtype_dict, str):
+        with open(subtype_dict, "r") as file:
+            subtype_dict = yaml.safe_load(file)
+
     # these markers have a sign at the end, which indicates positivity or negativity
     markers_with_sign = _get_markers_from_subtype_dict(subtype_dict)
     # here, we only store the markers without the sign
@@ -168,13 +174,12 @@ def predict_cell_subtypes(
     binarization_df["_labels"] = celltypes
     subtype_df = _predict_cell_subtypes(binarization_df, subtype_dict)
 
-    # adding the subtypes to the adata object
-    sdata.tables[table_key].obs = sdata.tables[table_key].obs.merge(
-        subtype_df, right_index=True, left_index=True, how="left"
-    )
-    # overwriting the celltype column
-    adata.obs["celltype"] = subtype_df.iloc[:, -1].values
-    adata.obs["celltype"] = adata.obs["celltype"].astype("category")
+    # adding the subtypes to the adata object, replacing the levels of previous predictions
+    obs = adata.obs.drop(columns=[col for col in subtype_df.columns if col in adata.obs.columns])
+    adata.obs = obs.merge(subtype_df, right_index=True, left_index=True, how="left")
+    # overwriting the label column with the most granular level
+    adata.obs[label_key] = subtype_df.iloc[:, -1].reindex(adata.obs_names).values
+    adata.obs[label_key] = adata.obs[label_key].astype("category")
 
     if copy:
         return sdata
@@ -224,9 +229,7 @@ class LabelAccessor:
             sel = [label_dict[indices]]
 
         if isinstance(indices, slice):
-            l_start = indices.start if indices.start is not None else 1
-            l_stop = indices.stop if indices.stop is not None else self._obj.sizes[Dims.LABELS]
-            sel = [i for i in range(l_start, l_stop)]
+            sel = _ids_in_slice(self._obj.coords[Dims.LABELS].values, indices)
 
         if isinstance(indices, (list, tuple)):
             if not all([isinstance(i, (str, int)) for i in indices]):
@@ -292,9 +295,7 @@ class LabelAccessor:
         - The function then updates the data object to remove the deselected label indices.
         """
         if isinstance(indices, slice):
-            l_start = indices.start if indices.start is not None else 1
-            l_stop = indices.stop if indices.stop is not None else self._obj.sizes[Dims.LABELS]
-            sel = [i for i in range(l_start, l_stop)]
+            sel = _ids_in_slice(self._obj.coords[Dims.LABELS].values, indices)
         elif isinstance(indices, list):
             assert all([isinstance(i, (int, str)) for i in indices]), "All label indices must be integers or strings."
             if all([isinstance(i, int) for i in indices]):
@@ -323,7 +324,7 @@ class LabelAccessor:
 
         cells = self._obj.la._filter_cells_by_label(inv_sel)
 
-        obj = self._obj.sel({Dims.LABELS: inv_sel, Dims.CELLS: cells})
+        obj = _select_cells(self._obj, cells, **{Dims.LABELS: inv_sel})
 
         # removing all cells from the segmentation mask that are not in the cells array
         segmentation = obj[Layers.SEGMENTATION].values.copy()
@@ -337,7 +338,7 @@ class LabelAccessor:
         return obj
 
     def _relabel_dict(self, dictionary: dict):
-        _, fw, _ = relabel_sequential(self._obj.coords[Dims.LABELS].values)
+        _, fw, _ = relabel_sequential(self._obj.coords[Dims.LABELS].values.copy())
         return {fw[k]: v for k, v in dictionary.items()}
 
     def _label_to_dict(
@@ -463,31 +464,21 @@ class LabelAccessor:
 
         return label_names_reverse[label]
 
-    def _filter_by_intensity(
-        self, channel: str, func: Callable, layer_key: str = Layers.INTENSITY, return_int_array: bool = True
-    ) -> xr.Dataset:
+    def _filter_by_intensity(self, channel: str, func: Callable, layer_key: str = Layers.INTENSITY) -> np.ndarray:
         """
-        Filter the cells based on intensity values for a specific channel. Useful for binarizing markers.
+        Binarize the intensity values of a channel. Used by la.threshold_labels().
 
         Parameters:
-            channel (str): The channel to filter on.
-            func (Callable): A function that takes in intensity values and returns a boolean array indicating which cells to keep.
+            channel (str): The channel to binarize.
+            func (Callable): A function that takes in intensity values and returns a boolean array.
             layer_key (str, optional): The key of the layer containing the intensity values. Defaults to Layers.INTENSITY.
-            return_int_array (bool, optional): Whether to return the filtered cells as a numeric array (0 for False, 1 for True). Defaults to True.
 
         Returns:
-            xarray.Dataset: The filtered cells as a DataArray if return_int_array is False, otherwise a numeric array.
+            np.ndarray: An integer array with 1 for cells where func is True and 0 otherwise.
         """
         cells = self._obj[layer_key].sel({Dims.CHANNELS: channel}).values.copy()
-        cells_bool = func(cells)
-
-        if return_int_array:
-            # turning the boolean array into a numeric array (where 0 is False, 1 is True)
-            return cells_bool.astype(int)
-
-        cells_sel = self._obj.coords[Dims.CELLS][cells_bool].values
-
-        return self._obj.sel({Dims.CELLS: cells_sel})
+        # turning the boolean array into a numeric array (where 0 is False, 1 is True)
+        return func(cells).astype(int)
 
     def add_label_type(self, name: str, color: str = "w") -> xr.Dataset:
         """
@@ -566,7 +557,7 @@ class LabelAccessor:
 
         return obj
 
-    def remove_label_type(self, cell_type: Union[int, List[int]]) -> xr.Dataset:
+    def remove_label_type(self, cell_type: Union[int, str, List[Union[int, str]]]) -> xr.Dataset:
         """
         Remove specific cell type label(s) from the data object.
 
@@ -575,8 +566,8 @@ class LabelAccessor:
 
         Parameters
         ----------
-        cell_type : int or list of int
-            The ID(s) of the cell type label(s) to be removed.
+        cell_type : int, str or list of int or str
+            The ID(s) or name(s) of the cell type label(s) to be removed.
 
         Returns
         -------
@@ -594,20 +585,19 @@ class LabelAccessor:
         - The function first checks for the existence of cell type labels in the data object.
         - It then removes the specified 'cell_type' from the cell type labels, setting their cells to the 'Unlabeled' category.
         """
-        if isinstance(cell_type, int):
+        if isinstance(cell_type, (int, str)):
             cell_type = [cell_type]
-
-        if isinstance(cell_type, str):
-            cell_type = [self._obj.la._label_name_to_id(cell_type)]
 
         if Layers.LA_PROPERTIES not in self._obj:
             raise ValueError("No cell type labels found.")
+
+        cell_type = [self._obj.la._label_name_to_id(i) if isinstance(i, str) else i for i in cell_type]
 
         for i in cell_type:
             if i not in self._obj.coords[Dims.LABELS].values:
                 raise ValueError(f"Cell type {i} not found.")
 
-        cells_bool = (self._obj[Layers.OBS].sel({Dims.FEATURES: Features.LABELS}) == cell_type).values
+        cells_bool = np.isin(self._obj[Layers.OBS].sel({Dims.FEATURES: Features.LABELS}).values, cell_type)
         cells = self._obj.coords[Dims.CELLS][cells_bool].values
 
         # Make a copy of the object to avoid modifying self._obj
@@ -620,11 +610,37 @@ class LabelAccessor:
         # Replace the OBS layer in the copied object
         obj = obj.assign({Layers.OBS: new_obs})
 
-        # Exclude the specified cell type from the label dimension (robust to string input)
-        if isinstance(cell_type, str):
-            obj = obj.sel({Dims.LABELS: obj.coords[Dims.LABELS] != cell_type})
+        remaining_labels = [i for i in obj.coords[Dims.LABELS].values if i not in cell_type]
+
+        # the cells of the removed types are now unlabeled (0)
+        # if there is no entry for label 0 yet, we add one, so that every label in obs has properties
+        if len(cells) > 0 and 0 not in obj.coords[Dims.LABELS].values:
+            removed = obj.sel({Dims.LABELS: cell_type})
+            obj[Layers.LA_PROPERTIES] = obj[Layers.LA_PROPERTIES].astype(object)
+            obj = obj.reindex({Dims.LABELS: [0, *remaining_labels]})
+
+            props = obj[Layers.LA_PROPERTIES]
+            props.loc[{Dims.LABELS: 0}] = ""
+            props.loc[{Dims.LABELS: 0, Dims.LA_PROPS: Props.NAME}] = Labels.UNLABELED
+            props.loc[{Dims.LABELS: 0, Dims.LA_PROPS: Props.COLOR}] = "black"
+            obj[Layers.LA_PROPERTIES] = props.astype(str)
+
+            # other layers with a labels dimension (e. g. neighborhood compositions) attribute the removed types to 0
+            for layer in obj.data_vars:
+                if layer != Layers.LA_PROPERTIES and Dims.LABELS in obj[layer].dims:
+                    obj[layer].loc[{Dims.LABELS: 0}] = removed[layer].sum(Dims.LABELS)
         else:
-            obj = obj.sel({Dims.LABELS: [i for i in obj.coords[Dims.LABELS] if i not in cell_type]})
+            removed = obj.sel({Dims.LABELS: cell_type})
+            # Exclude the specified cell types from the label dimension
+            obj = obj.sel({Dims.LABELS: remaining_labels})
+            # if there already is an entry for label 0, other layers with a labels dimension
+            # (e. g. neighborhood compositions) attribute the removed types to it as well
+            if 0 in remaining_labels:
+                for layer in obj.data_vars:
+                    if layer != Layers.LA_PROPERTIES and Dims.LABELS in obj[layer].dims:
+                        updated = obj[layer].copy()
+                        updated.loc[{Dims.LABELS: 0}] = updated.sel({Dims.LABELS: 0}) + removed[layer].sum(Dims.LABELS)
+                        obj[layer] = updated
 
         return obj
 
@@ -671,13 +687,17 @@ class LabelAccessor:
             name=Layers.LA_PROPERTIES,
         )
 
-        if Layers.LA_PROPERTIES in self._obj:
+        obj = self._obj
+        if Layers.LA_PROPERTIES in obj:
             da = xr.concat(
-                [self._obj[Layers.LA_PROPERTIES], da],
+                [obj[Layers.LA_PROPERTIES], da],
                 dim=Dims.LA_PROPS,
             )
+            # dropping the old layer, otherwise the outer join would reindex it and fill it with NaNs,
+            # which fails for numpy StringDType arrays (as returned by xarray>=2026 when reading zarr)
+            obj = obj.drop_vars([Layers.LA_PROPERTIES, Dims.LA_PROPS])
 
-        return xr.merge([da, self._obj], join="outer", compat="no_conflicts")
+        return xr.merge([da, obj], join="outer", compat="no_conflicts")
 
     def set_label_name(self, label, name):
         """
@@ -715,6 +735,9 @@ class LabelAccessor:
 
         # getting the original label properties
         property_layer = self._obj[Layers.LA_PROPERTIES].copy()
+        # fixed-width strings (e.g. from zarr v2 files) would truncate longer names, so we convert them to objects
+        if property_layer.dtype.kind == "U":
+            property_layer = property_layer.astype(object)
 
         if isinstance(label, str):
             label = self._obj.la._label_name_to_id(label)
@@ -750,7 +773,7 @@ class LabelAccessor:
         - The function converts the 'label' from its name to the corresponding ID for internal processing.
         - It updates the color of the cell type label in the data object to the new 'color'.
         """
-        if isinstance(labels, str):
+        if isinstance(labels, (str, int)):
             labels = [labels]
         if isinstance(colors, str):
             colors = [colors]
@@ -767,6 +790,9 @@ class LabelAccessor:
         props_layer = self._obj.coords[Dims.LA_PROPS].values.tolist()
         labels_layer = self._obj.coords[Dims.LABELS].values.tolist()
         array = self._obj[Layers.LA_PROPERTIES].values.copy()
+        # fixed-width strings (e.g. from zarr v2 files) would truncate longer colors, so we convert them to objects
+        if array.dtype.kind == "U":
+            array = array.astype(object)
 
         for label, color in zip(labels, colors):
             # if the label does not exist in the object, a warning is thrown and we continue
@@ -774,8 +800,9 @@ class LabelAccessor:
                 logger.warning(f"Label {label} not found in the data object. Skipping.")
                 continue
 
-            # getting the id for the label
-            label = self._obj.la._label_name_to_id(label)
+            # getting the id for the label (if the input was not numeric already)
+            if isinstance(label, str):
+                label = self._obj.la._label_name_to_id(label)
 
             # setting the new color for the given label
             array[labels_layer.index(label), props_layer.index(Props.COLOR)] = color
@@ -1038,6 +1065,17 @@ class LabelAccessor:
             assert (
                 sub.shape[0] != 0
             ), f"Could not find any overlap between the cells in the data frame's {cell_col} column and the cells in the object. Please make sure the cells for which you want to add labels are present in the object."
+
+            # cells without a label are kept as unlabeled cells, so that obs and the segmentation stay in sync
+            missing_cells = np.setdiff1d(self._obj.coords[Dims.CELLS].values, sub[cell_col].values)
+            if len(missing_cells) > 0:
+                logger.warning(
+                    f"Found {len(missing_cells)} cells without a label in the data frame. These cells will be set to {Labels.UNLABELED}."
+                )
+                fill_value = Labels.UNLABELED if sub[label_col].map(lambda x: isinstance(x, str)).all() else 0
+                sub = pd.concat([sub, pd.DataFrame({cell_col: missing_cells, label_col: fill_value})])
+            sub = sub.sort_values(cell_col)
+
             cells = sub.loc[:, cell_col].to_numpy().squeeze()
             labels = sub.loc[:, label_col].to_numpy().squeeze()
 
@@ -1059,7 +1097,7 @@ class LabelAccessor:
                 labels = np.array([label_to_num[label] for label in labels])
                 names = [k for k, v in sorted(label_to_num.items(), key=lambda x: x[1])]
 
-            assert ~np.all(labels < 0), "Labels must be >= 0."
+            assert not np.any(labels < 0), "Labels must be >= 0."
 
             formated_labels = _format_labels(labels)
             unique_labels = np.unique(formated_labels)
@@ -1075,17 +1113,19 @@ class LabelAccessor:
         if ignore_neighborhoods:
             obj = obj.pp.drop_layers(Layers.NEIGHBORHOODS)
 
-        obj = xr.merge([obj.sel(cells=da.cells), da], join="outer", compat="no_conflicts")
+        obj = xr.merge([_select_cells(obj, cells), da], join="outer", compat="no_conflicts")
 
         if colors is not None:
-            assert len(colors) == len(unique_labels), "Colors has the same."
+            assert len(colors) == len(
+                unique_labels
+            ), f"Got {len(colors)} colors for {len(unique_labels)} unique labels."
         else:
-            colors = np.random.choice(COLORS, size=len(unique_labels), replace=False)
+            colors = _sample_colors(len(unique_labels))
 
         obj = obj.la.add_properties(colors, Props.COLOR)
 
         if names is not None:
-            assert len(names) == len(unique_labels), "Names has the same."
+            assert len(names) == len(unique_labels), f"Got {len(names)} names for {len(unique_labels)} unique labels."
         else:
             # if there is a 0 in unique labels, we need to add an unlabeled category
             if 0 in unique_labels:
@@ -1095,7 +1135,7 @@ class LabelAccessor:
 
         obj = obj.la.add_properties(names, Props.NAME)
 
-        return xr.merge([obj.sel(cells=da.cells), da], join="outer", compat="no_conflicts")
+        return xr.merge([_select_cells(obj, cells), da], join="outer", compat="no_conflicts")
 
     def add_properties(
         self, array: Union[np.ndarray, list], prop: str = Features.LABELS, return_xarray: bool = False
@@ -1135,13 +1175,17 @@ class LabelAccessor:
         if return_xarray:
             return da
 
-        if Layers.LA_PROPERTIES in self._obj:
+        obj = self._obj
+        if Layers.LA_PROPERTIES in obj:
             da = xr.concat(
-                [self._obj[Layers.LA_PROPERTIES], da],
+                [obj[Layers.LA_PROPERTIES], da],
                 dim=Dims.LA_PROPS,
             )
+            # dropping the old layer, otherwise the outer join would reindex it and fill it with NaNs,
+            # which fails for numpy StringDType arrays (as returned by xarray>=2026 when reading zarr)
+            obj = obj.drop_vars([Layers.LA_PROPERTIES, Dims.LA_PROPS])
 
-        return xr.merge([da, self._obj], join="outer", compat="no_conflicts")
+        return xr.merge([da, obj], join="outer", compat="no_conflicts")
 
     def predict_cell_subtypes(
         self, subtype_dict: Union[dict, str], overwrite_existing_labels: bool = True

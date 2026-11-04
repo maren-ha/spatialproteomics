@@ -5,7 +5,9 @@ import pandas as pd
 import xarray as xr
 
 from ..base_logger import logger
-from ..constants import COLORS, Dims, Features, Layers, Props
+from ..constants import Dims, Features, Layers, Props
+from ..pl.utils import _sample_colors
+from ..pp.utils import _ids_in_slice, _select_cells
 from .utils import (
     _compute_global_network_features,
     _compute_network_features,
@@ -56,9 +58,7 @@ class NeighborhoodAccessor:
             sel = [neighborhood_dict[indices]]
 
         if isinstance(indices, slice):
-            l_start = indices.start if indices.start is not None else 1
-            l_stop = indices.stop if indices.stop is not None else self._obj.sizes[Dims.NEIGHBORHOODS]
-            sel = [i for i in range(l_start, l_stop)]
+            sel = _ids_in_slice(self._obj.coords[Dims.NEIGHBORHOODS].values, indices)
 
         if isinstance(indices, (list, tuple)):
             if not all([isinstance(i, (str, int)) for i in indices]):
@@ -124,9 +124,7 @@ class NeighborhoodAccessor:
         - The function then updates the data object to remove the deselected neighborhood indices.
         """
         if isinstance(indices, slice):
-            l_start = indices.start if indices.start is not None else 1
-            l_stop = indices.stop if indices.stop is not None else self._obj.sizes[Dims.NEIGHBORHOODS]
-            sel = [i for i in range(l_start, l_stop)]
+            sel = _ids_in_slice(self._obj.coords[Dims.NEIGHBORHOODS].values, indices)
         elif isinstance(indices, list):
             assert all(
                 [isinstance(i, (int, str)) for i in indices]
@@ -157,7 +155,7 @@ class NeighborhoodAccessor:
 
         cells = self._obj.nh._filter_cells_by_neighborhood(inv_sel)
 
-        obj = self._obj.sel({Dims.NEIGHBORHOODS: inv_sel, Dims.CELLS: cells})
+        obj = _select_cells(self._obj, cells, **{Dims.NEIGHBORHOODS: inv_sel})
 
         # removing all cells from the segmentation mask that are not in the cells array
         segmentation = obj[Layers.SEGMENTATION].values.copy()
@@ -276,13 +274,15 @@ class NeighborhoodAccessor:
             name=Layers.NH_PROPERTIES,
         )
 
-        if Layers.NH_PROPERTIES in self._obj:
+        obj = self._obj
+        if Layers.NH_PROPERTIES in obj:
             da = xr.concat(
-                [self._obj[Layers.NH_PROPERTIES], da],
+                [obj[Layers.NH_PROPERTIES], da],
                 dim=Dims.NH_PROPS,
             )
+            obj = obj.drop_vars([Layers.NH_PROPERTIES, Dims.NH_PROPS])
 
-        return xr.merge([da, self._obj], join="outer", compat="no_conflicts")
+        return xr.merge([da, obj], join="outer", compat="no_conflicts")
 
     def add_neighborhoods_from_dataframe(
         self,
@@ -345,7 +345,7 @@ class NeighborhoodAccessor:
             neighborhoods = np.array([neighborhood_to_num[neighborhood] for neighborhood in neighborhoods])
             names = [k for k, v in sorted(neighborhood_to_num.items(), key=lambda x: x[1])]
 
-        assert ~np.all(neighborhoods < 0), "Neighborhoods must be >= 0."
+        assert not np.any(neighborhoods < 0), "Neighborhoods must be >= 0."
 
         formated_neighborhoods = _format_neighborhoods(neighborhoods)
         unique_neighborhoods = np.unique(formated_neighborhoods)
@@ -360,7 +360,7 @@ class NeighborhoodAccessor:
                 unique_neighborhoods
             ), f"Colors does not have the same length as there are neighborhoods. Got {len(colors)} colors for {len(unique_neighborhoods)} neighborhoods."
         else:
-            colors = np.random.choice(COLORS, size=len(unique_neighborhoods), replace=False)
+            colors = _sample_colors(len(unique_neighborhoods))
 
         # adding a lookup table for the neighborhood colors
         obj = obj.nh.add_properties(colors, Props.COLOR)
@@ -465,6 +465,9 @@ class NeighborhoodAccessor:
         props_layer = self._obj.coords[Dims.NH_PROPS].values.tolist()
         neighborhoods_layer = self._obj.coords[Dims.NEIGHBORHOODS].values.tolist()
         array = self._obj[Layers.NH_PROPERTIES].values.copy()
+        # fixed-width strings (e.g. from zarr v2 files) would truncate longer colors, so we convert them to objects
+        if array.dtype.kind == "U":
+            array = array.astype(object)
 
         for neighborhood, color in zip(neighborhoods, colors):
             # if the neighborhoods does not exist in the object, a warning is thrown and we continue
@@ -569,6 +572,9 @@ class NeighborhoodAccessor:
 
         # Retrieve the original neighborhood properties
         property_layer = self._obj[Layers.NH_PROPERTIES].copy()
+        # fixed-width strings (e.g. from zarr v2 files) would truncate longer names, so we convert them to objects
+        if property_layer.dtype.kind == "U":
+            property_layer = property_layer.astype(object)
 
         for n, new_name in zip(neighborhoods, names):
             # Convert neighborhood name to ID if necessary
@@ -675,9 +681,9 @@ class NeighborhoodAccessor:
         Parameters
         ----------
         k : int, optional
-            The number of nearest neighbors to consider. Default is 10.
+            The number of nearest neighbors to consider, not counting the center cell. Default is 10.
         include_center : bool, optional
-            Whether to include the center cell in the neighborhood. Default is True.
+            Whether to add the center cell to its k nearest neighbors in the neighborhood. Default is True.
         key_added : str, optional
             The key under which the computed neighborhoods will be stored in the resulting DataArray. Default is '_neighborhoods'.
         key_adjacency_matrix : str, optional
@@ -848,6 +854,8 @@ class NeighborhoodAccessor:
 
             adjacency_matrix = self._obj[Layers.ADJACENCY_MATRIX].values
             G = nx.from_numpy_array(adjacency_matrix)
+            # a cell is not its own neighbor (adjacency matrices computed with older versions contain self-loops)
+            G.remove_edges_from(list(nx.selfloop_edges(G)))
 
             # adding labels as node attributes
             spatial_df = self._obj.pp.get_layer_as_df(Layers.OBS)
@@ -924,6 +932,8 @@ class NeighborhoodAccessor:
 
             adjacency_matrix = self._obj[Layers.ADJACENCY_MATRIX].values
             G = nx.from_numpy_array(adjacency_matrix)
+            # a cell is not its own neighbor (adjacency matrices computed with older versions contain self-loops)
+            G.remove_edges_from(list(nx.selfloop_edges(G)))
 
             # adding labels as node attributes
             spatial_df = self._obj.pp.get_layer_as_df(Layers.OBS)

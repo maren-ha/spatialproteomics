@@ -13,6 +13,30 @@ from ..base_logger import logger
 from ..constants import Dims
 
 
+def _select_cells(obj, cells, **other_indexers):
+    """Subset an object to the given cells, keeping cells and cells_2 (adjacency matrix) in sync."""
+    cells = np.asarray(cells)
+    query = {Dims.CELLS: cells, **other_indexers}
+    if Dims.CELLS_2 in obj.dims:
+        query[Dims.CELLS_2] = cells
+    return obj.sel(query)
+
+
+def _ids_in_slice(ids, indices: slice) -> list:
+    """Return the ids (e.g. labels or neighborhoods) that lie within the slice. The stop value is excluded."""
+    return [
+        i for i in ids if (indices.start is None or i >= indices.start) and (indices.stop is None or i < indices.stop)
+    ][:: indices.step]
+
+
+def _relabel_cell_coords(obj, relabel_dict: dict):
+    """Rename the cell ids in cells (and cells_2, if present) according to relabel_dict."""
+    coords = {Dims.CELLS: [relabel_dict[c] for c in obj.coords[Dims.CELLS].values]}
+    if Dims.CELLS_2 in obj.dims:
+        coords[Dims.CELLS_2] = [relabel_dict[c] for c in obj.coords[Dims.CELLS_2].values]
+    return obj.assign_coords(coords)
+
+
 def merge(images: List[np.ndarray], proj: str = "sum", alpha: float = 0.5):
     """
     Merge multiple images into a single image using different projection methods.
@@ -32,8 +56,10 @@ def merge(images: List[np.ndarray], proj: str = "sum", alpha: float = 0.5):
         im_combined[im_combined > 1] = 1
     elif proj == "blend":
         im_base = images[0].copy()
+        im_combined = im_base
         for i in range(1, len(images)):
-            alpha_a = images[i][:, :, 3][:, :, np.newaxis]
+            # copying the alpha channel, so that the input images are not modified
+            alpha_a = images[i][:, :, 3][:, :, np.newaxis].copy()
             alpha_a[alpha_a > 0] = alpha
             alpha_b = im_base[:, :, 3][:, :, np.newaxis]
             alpha_0 = alpha_a + alpha_b * (1 - alpha_a)
@@ -42,6 +68,8 @@ def merge(images: List[np.ndarray], proj: str = "sum", alpha: float = 0.5):
                 images[i][:, :, 0:3] * alpha_a + im_base[:, :, 0:3] * alpha_b * (1 - alpha_a)
             ) / alpha_0
             im_base = im_combined
+    else:
+        raise ValueError(f"Unknown projection method {proj}. Please use 'sum' or 'blend'.")
 
     return im_combined
 
@@ -83,14 +111,16 @@ def _relabel_cells(segmentation: np.ndarray) -> Tuple[np.ndarray, dict]:
     Tuple[np.ndarray, dict]
         A tuple containing the relabeled segmentation array and a mapping dictionary.
     """
-    # find unique cell IDs
+    # find unique cell IDs (0 is the background and always stays 0, even if the mask does not contain any background)
     unique_values = np.unique(segmentation)
+    cell_ids = unique_values[unique_values != 0]
 
     # create a mapping from original values to new values
-    value_map = {value: i for i, value in enumerate(unique_values)}
+    value_map = {0: 0, **{value: i for i, value in enumerate(cell_ids, start=1)}}
 
-    # map the original array to the new values using the mapping
-    segmentation_relabeled = np.vectorize(lambda x: value_map[x], otypes=[segmentation.dtype.char])(segmentation)
+    # map the original array to the new values
+    segmentation_relabeled, _, _ = relabel_sequential(segmentation)
+    segmentation_relabeled = segmentation_relabeled.astype(segmentation.dtype)
 
     return segmentation_relabeled, value_map
 
@@ -208,8 +238,9 @@ def _merge_segmentation(
 
     # i1: s1 regions that survived into the combined mask (should always be all of them)
     # i2: s2 regions that survived into the combined mask (may be partial if they overlapped with s1)
-    i1 = list(set(l1) & set(l3))
-    i2 = list(set(l2) & set(l3))
+    # both are sorted, so that they line up with the regionprops below (which are ordered by label)
+    i1 = sorted(set(l1) & set(l3))
+    i2 = sorted(set(l2) & set(l3))
 
     # threshold1 filter: only keep s2 regions where the surviving area (in s3) is at least
     # threshold1 fraction of the original s2 area. Regions heavily masked by s1 are dropped.
@@ -439,7 +470,8 @@ def _get_disconnected_cell(segmentation: np.ndarray) -> int:
     """
     for cell in sorted(np.unique(segmentation))[1:]:
         binary_mask = np.where(segmentation == cell, 1, 0)
-        _, num_features = scipy.ndimage.label(binary_mask)
+        # using 8-connectivity, as in _check_for_disconnected_cells and handle_disconnected_cells
+        _, num_features = scipy.ndimage.label(binary_mask, structure=np.ones((3, 3)))
         if num_features != 1:
             return cell
 
@@ -657,6 +689,11 @@ def _threshold(
 
     if intensity is not None:
         if intensity.size == 1:
+            # numpy < 2 silently wraps out-of-bounds integers around, so we check the bounds explicitly
+            if np.issubdtype(img_dtype, np.integer) and not (
+                np.iinfo(img_dtype).min <= intensity.item() <= np.iinfo(img_dtype).max
+            ):
+                raise OverflowError(f"Python integer {intensity.item()} out of bounds for {img_dtype}")
             intensity = np.full(len(all_channels), intensity.item(), dtype=img_dtype)
         else:
             # casting to float here to allow for NAs (important when using the channels argument)
@@ -768,12 +805,15 @@ def _transform_expression_matrix(
 
 def _validate_and_clamp_slice(start, stop, dim, slice_name="x_slice"):
     """
-    Validate a slice [start, stop) against the coordinate axis 'dim'.
+    Validate a slice [start, stop] against the coordinate axis 'dim'.
 
     - Assumes dim.values[0] .. dim.values[-1] are the valid (inclusive) coordinates.
     - Treats `start` inclusive, `stop` exclusive (so valid stop <= max + 1).
     - Raises ValueError if the slice is completely outside the image bounds.
     - Warns and clamps if the slice is partially outside.
+    - Treats both `start` and `stop` as inclusive, since the slice is applied with label-based
+      indexing (xarray's .sel). A stop of max + 1 is accepted without a warning, so that
+      slices such as 0:width do not warn.
     - Raises ValueError if start >= stop (empty/invalid slice).
 
     Returns (clamped_start, clamped_stop).
@@ -785,8 +825,8 @@ def _validate_and_clamp_slice(start, stop, dim, slice_name="x_slice"):
     if start >= stop:
         raise ValueError(f"{slice_name} is invalid: start ({start}) >= stop ({stop}).")
 
-    # slice is entirely to the left if its last index (stop-1) < minv
-    entirely_left = (stop - 1) < minv
+    # slice is entirely to the left if its last index (stop) < minv
+    entirely_left = stop < minv
     # slice is entirely to the right if its first index (start) > maxv
     entirely_right = start > maxv
 
@@ -798,7 +838,7 @@ def _validate_and_clamp_slice(start, stop, dim, slice_name="x_slice"):
 
     # Now check for partial out-of-bounds and clamp
     clamped_start = max(start, minv)
-    clamped_stop = min(stop, maxv + 1)  # stop is exclusive, so allow maxv+1
+    clamped_stop = min(stop, maxv + 1)  # allow maxv+1 without a warning, selecting up to maxv
 
     if clamped_start != start or clamped_stop != stop:
         warnings.warn(
@@ -839,12 +879,22 @@ def _merge_channels(arr: np.ndarray, method: Union[str, callable] = "max", norma
         )
 
     # ensure the merged array has the correct dtype (if the input was integer, output should also be integer, but we need to check for overflow)
-    # if there is overflow, we change the dtype to int64
+    # if there is overflow, we change the dtype to a 64 bit integer (numpy reductions such as sum return those anyway)
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
-        if merged.max() > info.max:
-            merged = merged.astype(np.uint64)
+        if merged.max() > info.max or merged.min() < info.min:
+            merged = merged.astype(np.int64 if np.issubdtype(dtype, np.signedinteger) else np.uint64)
+        else:
+            merged = np.round(merged).astype(dtype)
     else:
         merged = merged.astype(dtype)
 
     return merged
+
+
+def _pixel_to_coordinate(values: np.ndarray, coords: np.ndarray) -> np.ndarray:
+    """Map (sub)pixel positions along one axis onto the corresponding coordinate values of that axis."""
+    coords = np.asarray(coords, dtype=float)
+    if len(coords) == 1:
+        return np.asarray(values, dtype=float) + coords[0]
+    return np.interp(values, np.arange(len(coords)), coords)

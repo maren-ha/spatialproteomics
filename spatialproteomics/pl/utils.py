@@ -9,7 +9,41 @@ from skimage.morphology import closing, dilation, disk, erosion, footprint_recta
 from skimage.segmentation import find_boundaries
 
 from ..base_logger import logger
+from ..constants import COLORS
 from ..pp.utils import _normalize
+
+
+def _sample_colors(n: int) -> np.ndarray:
+    """
+    Randomly sample n distinct colors (hex strings) from the default color palette.
+
+    If more colors are requested than the palette contains, all palette colors are used and the remaining colors are
+    generated randomly.
+
+    Parameters
+    ----------
+    n : int
+        The number of colors.
+
+    Returns
+    -------
+    np.ndarray
+        An array of n distinct hex colors.
+    """
+    if n <= len(COLORS):
+        return np.random.choice(COLORS, size=n, replace=False)
+
+    logger.warning(
+        f"Requested {n} colors, but the default palette only contains {len(COLORS)} colors. The remaining colors are generated randomly, you can set them yourself with the colors argument."
+    )
+    colors = list(np.random.permutation(COLORS))
+    existing = {color.upper() for color in colors}
+    while len(colors) < n:
+        color = mcolors.to_hex(np.random.rand(3)).upper()
+        if color not in existing:
+            existing.add(color)
+            colors.append(color)
+    return np.array(colors)
 
 
 def _get_linear_colormap(palette: list, background: str = "black"):
@@ -65,9 +99,9 @@ def _get_listed_colormap(palette: dict):
 
     # adding black background if we don't have any unlabeled (0) cells
     if 0 in sorted_labels:
-        cmap = ListedColormap(colors, N=len(colors))
+        cmap = ListedColormap(colors)
     else:
-        cmap = ListedColormap(["black"] + colors, N=len(colors) + 1)
+        cmap = ListedColormap(["black"] + colors)
 
     return cmap
 
@@ -103,6 +137,10 @@ def _colorize(
     assert (
         len(colors) >= num_channels
     ), "Length of colors must at least be greater or equal the number of channels of the image."
+
+    invalid_colors = [c for c in list(colors[:num_channels]) + [background] if not mcolors.is_color_like(c)]
+    if invalid_colors:
+        raise ValueError(f"Invalid color(s): {invalid_colors}. Please provide valid matplotlib colors.")
 
     cmaps = _get_linear_colormap(colors[:num_channels], background)
 

@@ -125,6 +125,7 @@ def read_from_spatialdata(
         spatial_data_object (spatialdata.SpatialData, str): The spatialdata object to read data from. If str, spatialdata is used to read the file from that path.
         image_key (str): The key of the image in the spatialdata object.
         segmentation_key (str): The key of the segmentation in the spatialdata object.
+        table_key (str): The key of the table in the spatialdata object. If it does not exist, the observations are computed from the segmentation.
         data_key (Optional[str], optional): The key for the image data in the spatialdata object. If None, the image_key will be used. Defaults to None.
         consolidate_segmentation (bool, optional): If True, the segmentation will be consolidated to only include cells that are present in the table. Defaults to False.
         cell_id (Optional[str], optional): The column name for the cell ID in the table. Defaults to "id".
@@ -132,12 +133,7 @@ def read_from_spatialdata(
         spatialproteomics_object (xr.Dataset): The spatialproteomics object.
     """
     import spatialdata
-    from spatialdata.transformations import (
-        Affine,
-        Identity,
-        Translation,
-        get_transformation,
-    )
+    from spatialdata.transformations import get_transformation
 
     if isinstance(spatial_data_object, str):
         spatial_data_object = spatialdata.read_zarr(spatial_data_object)
@@ -160,30 +156,20 @@ def read_from_spatialdata(
     y_coords = np.arange(image.shape[1])
     x_coords = np.arange(image.shape[2])
 
-    # apply transform if exists
-    if isinstance(transform, Identity):
-        pass  # Identity transform — do nothing
-
-    elif isinstance(transform, Translation):
-        shift_y, shift_x = transform.translation
-        y_coords = y_coords + shift_y
-        x_coords = x_coords + shift_x
-
-    elif isinstance(transform, Affine):
-        matrix = transform.matrix
-
-        a, b, c = matrix[0, :]
-        d, e, f = matrix[1, :]
-
-        if not np.isclose(b, 0) or not np.isclose(d, 0):
-            logger.warning(
-                "Affine transformation has shear components, which are not supported in spatialproteomics. Resetting coordinates to start from 0."
-            )
-        else:
-            x_coords = a * x_coords + c
-            y_coords = e * y_coords + f
+    # express any transform (Identity, Translation, Scale, Affine, Sequence, ...) as a 2D x/y affine.
+    # do not read transform.matrix directly: after a zarr round trip spatialdata stores the affine on
+    # the element axes, e.g. (c, y, x -> c, x, y), so the raw matrix is 4x4 and its row order varies.
+    matrix = transform.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+    a, b, c = matrix[0, :]
+    d, e, f = matrix[1, :]
+    if not np.isclose(b, 0) or not np.isclose(d, 0):
+        logger.warning(
+            "Affine transformation has shear components, which are not supported in spatialproteomics. "
+            "Resetting coordinates to start from 0."
+        )
     else:
-        logger.warning(f"Unsupported transform {transform}, resetting coordinates for the spatialproteomics object.")
+        x_coords = a * x_coords + c
+        y_coords = e * y_coords + f
 
     # create the spatialproteomics object
     obj = load_image_data(image, channel_coords=markers, x_coords=x_coords, y_coords=y_coords)
@@ -213,35 +199,49 @@ def read_from_spatialdata(
             )  # Cast back to original dtype
 
         # if there are obs in the spatialdata object, we just use those and do not recompute them
-        add_obs_from_sdata = len(spatial_data_object.tables.keys()) > 0
+        add_obs_from_sdata = table_key in spatial_data_object.tables
+        if not add_obs_from_sdata and len(spatial_data_object.tables.keys()) > 0:
+            logger.warning(
+                f"Table key {table_key} not found in spatial data object (available keys: {list(spatial_data_object.tables.keys())}). "
+                "Computing the observations from the segmentation instead."
+            )
 
-        # obs (from anndata)
         if add_obs_from_sdata:
-            obs = spatial_data_object.tables[table_key].obs
-            if not consolidate_segmentation:
-                assert (
-                    obs.shape[0] == len(np.unique(segmentation)) - 1
-                ), f"The number of cells in the segmentation does not match the number of observations in the table.\nNumber of cells in the segmentation mask: {len(np.unique(segmentation)) - 1}\nNumber of observations: {obs.shape[0]}\nIf you wish to proceed regardless, set `consolidate_segmentation=True`, which will only keep cells appearing both in the segmentation mask and the table."
-            else:
+            # copying, so that the table of the input object is not modified
+            obs = spatial_data_object.tables[table_key].obs.copy()
+            assert (
+                cell_id in obs.columns
+            ), f"Column {cell_id} not found in the table. It is required to match the rows of the table to the cells in the segmentation mask. Available columns: {list(obs.columns)}."
+            obs[cell_id] = obs[cell_id].astype(int)
+
+            if consolidate_segmentation:
                 # Consolidate segmentation to only include cells that are present in the table and the segmentation mask
-                # Step 1: Get IDs in both segmentation and obs
-                ids_in_segmentation = np.unique(segmentation).astype(int)
-                ids_in_obs = obs[cell_id].astype(int).unique()
+                # Step 1: Keep only valid IDs (appear in both the segmentation and the table)
+                valid_ids = np.intersect1d(np.unique(segmentation).astype(int), obs[cell_id].unique())
 
-                # Step 2: Keep only valid IDs (appear in both)
-                valid_ids = np.intersect1d(ids_in_segmentation, ids_in_obs, assume_unique=True)
-
-                # Step 3: Filter segmentation mask to keep only valid IDs
+                # Step 2: Filter segmentation mask to keep only valid IDs
                 segmentation = np.where(np.isin(segmentation, valid_ids), segmentation, 0)
 
-                # Step 4: Filter obs to keep only cells present in segmentation
-                obs[cell_id] = obs[cell_id].astype(int)
-                obs = obs[obs[cell_id].isin(valid_ids)].copy()
+                # Step 3: Filter obs to keep only cells present in segmentation
+                obs = obs[obs[cell_id].isin(valid_ids)]
 
-            obj = obj.pp.add_segmentation(segmentation, add_obs=not add_obs_from_sdata, reindex=False)
+            obj = obj.pp.add_segmentation(segmentation, add_obs=False, reindex=False)
+
+            # the cells coordinate is sorted by cell id, while the rows of the table can be in any order
+            # hence we align the table to the cells by their id instead of relying on the row order
+            cells = obj.coords[Dims.CELLS].values
+            table_ids = obs[cell_id].values
+            cells_without_row = np.setdiff1d(cells, table_ids)
+            rows_without_cell = np.setdiff1d(table_ids, cells)
+            has_duplicates = obs[cell_id].duplicated().any()
+            assert (
+                len(cells_without_row) == 0 and len(rows_without_cell) == 0 and not has_duplicates
+            ), f"The cell ids in the table do not match the cells in the segmentation mask.\nCells in the segmentation mask without a row in the table: {len(cells_without_row)}\nRows in the table without a cell in the segmentation mask: {len(rows_without_cell)}\nDuplicate ids in the table: {has_duplicates}\nIf you wish to proceed regardless, set `consolidate_segmentation=True`, which will only keep cells appearing both in the segmentation mask and the table."
+            obs = obs.set_index(cell_id, drop=False).loc[cells].rename_axis(None)
+
             # next to adding the obs from the dataframe, we also add default obs to the object to ensure that obs includes the centroids
             obj = obj.pp.add_obs_from_dataframe(obs).pp.add_observations()
         else:
-            obj = obj.pp.add_segmentation(segmentation, add_obs=not add_obs_from_sdata, reindex=False)
+            obj = obj.pp.add_segmentation(segmentation, add_obs=True, reindex=False)
 
     return obj

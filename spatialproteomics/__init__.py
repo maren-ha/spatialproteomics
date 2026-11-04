@@ -48,7 +48,7 @@ from .pp import (
     threshold,
     transform_expression_matrix,
 )
-from .tl import ToolAccessor, astir, cellpose, mesmer, stardist
+from .tl import ToolAccessor, astir, cellpose, instanseg, stardist
 
 __all__ = [
     "load_image_data",
@@ -57,19 +57,17 @@ __all__ = [
     "PreprocessingAccessor",
     "LabelAccessor",
     "PlotAccessor",
-    "SegmentationAccessor",
     "ToolAccessor",
     "NeighborhoodAccessor",
     "Layers",
     "Dims",
     "Features",
     "Props",
-    "merge_segmentation",
     "percentage_positive",
     "is_positive",
     "cellpose",
     "stardist",
-    "mesmer",
+    "instanseg",
     "add_observations",
     "add_quantification",
     "apply",
