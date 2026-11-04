@@ -1090,7 +1090,7 @@ class ToolAccessor:
 
     def project_virtues_cell_types_to_existing_segmentation(
         self,
-        cell_type_prediction: np.ndarray,
+        cell_type_prediction_key: str = "_virtues_cell_type_prediction",
         cell_type_label_key_added: str = "_virtues_cell_type",
         overwrite: bool = False,
     ) -> xr.Dataset:
@@ -1099,8 +1099,9 @@ class ToolAccessor:
 
         Parameters
         ----------
-        cell_type_prediction : np.ndarray
-            Pixel-wise VirTues class predictions before assignment to an instance segmentation.
+        cell_type_prediction_key : str, optional
+            Key of the stored pixel-wise VirTues class predictions before assignment to an instance segmentation.
+            The layer must have dimensions (y, x).
         cell_type_label_key_added : str, optional
             The column added to ``_la_layers``.
         overwrite : bool, optional
@@ -1116,7 +1117,7 @@ class ToolAccessor:
         Projection is explicit and always targets canonical "_segmentation" cells. To annotate another
         segmentation population, first make that segmentation canonical in a separate object.
         For each existing cell, the assigned VirTues cell type is the most frequent value of
-        ``cell_type_prediction`` under that cell's segmentation mask. Use the pixel-wise predictions rather
+        the layer selected by ``cell_type_prediction_key`` under that cell's segmentation mask. Use the pixel-wise predictions rather
         than a mask already assigned to VirTues cells. All supplied class IDs participate, including 0
         if present. Ties follow ``np.bincount(...).argmax()``
         and therefore choose the lowest tied integer cell type ID.
@@ -1125,6 +1126,11 @@ class ToolAccessor:
         from .virtues_utils import _project_virtues_cell_types_to_segmentation
 
         obj = self._obj
+        if cell_type_prediction_key not in obj:
+            raise KeyError(f"Layer {cell_type_prediction_key!r} not found.")
+        prediction_da = obj[cell_type_prediction_key]
+        if prediction_da.dims != (Dims.Y, Dims.X):
+            raise ValueError("Cell type predictions must have dimensions ['y', 'x'].")
         segmentation, cells = _get_virtues_canonical_segmentation(obj)
         if Layers.LA_LAYERS in obj:
             existing = obj[Layers.LA_LAYERS].to_pandas()
@@ -1132,7 +1138,7 @@ class ToolAccessor:
                 raise ValueError(f"Label layer column {cell_type_label_key_added} already exists.")
         else:
             existing = pd.DataFrame(index=cells)
-        cell_types = _project_virtues_cell_types_to_segmentation(cell_type_prediction, segmentation, cells)
+        cell_types = _project_virtues_cell_types_to_segmentation(prediction_da.values, segmentation, cells)
         existing[cell_type_label_key_added] = pd.Series(cell_types, index=cells)
         if Layers.LA_LAYERS in obj:
             obj = obj.drop_vars(Layers.LA_LAYERS)
